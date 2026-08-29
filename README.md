@@ -193,7 +193,7 @@ The adapter has been exercised through the live Hermes tool path:
 | `sports` | Verified | Adapter supplies the required `tool: "sports"` value. |
 | `time` | Verified | Specialized text output; `results` may be empty. |
 | `click` | Endpoint-dependent | Requires a valid reference ID and numbered link in the endpoint's request context. Stateless standalone calls may be rejected. |
-| `screenshot` | Endpoint-dependent | Requires a URL the endpoint fetches as `application/pdf`; deployments without PDF screenshot support reject it. |
+| `screenshot` | Endpoint-dependent | Open the PDF first, then reuse its `ref_id` in the same Hermes conversation; deployments without PDF screenshot support reject it. |
 
 A `success: true` response is not claimed for an upstream error string. The adapter converts recognized HTTP-200 endpoint errors into `success: false`.
 
@@ -202,7 +202,7 @@ A `success: true` response is not claimed for an upstream error string. The adap
 - This is an adapter around the endpoint, not the native Codex runtime.
 - Hermes does not provide native conversation-item input to plugin tools, so `context` is plain text only.
 - `reasoning` and native runtime headers are intentionally not exposed.
-- The plugin does not maintain a browser session between separate calls. Use returned URLs/reference IDs as supported by the endpoint.
+- The plugin does not own a browser session; it preserves a bounded in-process Alpha Search request context per Hermes conversation for follow-up reference IDs. Context is lost after eviction or process restart.
 - Endpoint availability still depends on the configured gateway and its upstream account/pool permissions.
 - Command support is verified against the current endpoint path, but an upstream deployment may reject a command it has disabled.
 

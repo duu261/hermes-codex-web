@@ -5,6 +5,7 @@ import os
 import sys
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +51,10 @@ class FakeResponse:
 
 
 class CodexWebTests(unittest.TestCase):
+    def setUp(self):
+        with provider._session_request_ids_lock:
+            provider._session_request_ids.clear()
+
     def test_builds_full_public_command_surface(self):
         payload = provider.build_codex_web_payload(
             {
@@ -153,7 +158,30 @@ class CodexWebTests(unittest.TestCase):
         request_ids = [json.loads(call.args[0].data)["id"] for call in open_url.call_args_list]
         self.assertEqual(request_ids[0], request_ids[1])
 
-        provider._session_request_id.cache_clear()
+
+    def test_session_request_id_is_isolated_and_concurrent(self):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            request_ids = list(executor.map(
+                provider._session_request_id,
+                ["same-session"] * 32,
+            ))
+
+        self.assertEqual(len(set(request_ids)), 1)
+        self.assertNotEqual(
+            provider._session_request_id("other-session"),
+            request_ids[0],
+        )
+
+    def test_session_request_id_cache_is_bounded(self):
+        for index in range(provider._SESSION_REQUEST_ID_LIMIT + 1):
+            provider._session_request_id(f"session-{index}")
+
+        with provider._session_request_ids_lock:
+            self.assertEqual(
+                len(provider._session_request_ids),
+                provider._SESSION_REQUEST_ID_LIMIT,
+            )
+            self.assertNotIn("session-0", provider._session_request_ids)
 
     def test_handler_rejects_output_without_results(self):
         with patch.dict("os.environ", {

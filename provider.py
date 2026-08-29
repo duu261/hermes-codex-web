@@ -7,7 +7,8 @@ import os
 import urllib.error
 import urllib.request
 import uuid
-from functools import lru_cache
+from collections import OrderedDict
+from threading import Lock
 from typing import Any
 
 DEFAULT_MODEL = "gpt-5.4-mini"
@@ -50,9 +51,22 @@ def _model() -> str:
     return DEFAULT_MODEL
 
 
-@lru_cache(maxsize=1024)
+_SESSION_REQUEST_ID_LIMIT = 1024
+_session_request_ids: OrderedDict[str, str] = OrderedDict()
+_session_request_ids_lock = Lock()
+
+
 def _session_request_id(session_id: str) -> str:
-    return str(uuid.uuid4())
+    with _session_request_ids_lock:
+        request_id = _session_request_ids.get(session_id)
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+            _session_request_ids[session_id] = request_id
+            if len(_session_request_ids) > _SESSION_REQUEST_ID_LIMIT:
+                _session_request_ids.popitem(last=False)
+        else:
+            _session_request_ids.move_to_end(session_id)
+        return request_id
 
 
 def _nonempty_string(value: Any, field: str) -> str:
@@ -391,7 +405,7 @@ CODEX_WEB_SCHEMA = {
             "open": {"type": "array", "items": {"type": "object", "required": ["ref_id"], "properties": {"ref_id": _REF, "lineno": {"type": "integer", "minimum": 0}}}},
             "click": {"type": "array", "items": {"type": "object", "required": ["ref_id", "id"], "properties": {"ref_id": _REF, "id": {"type": "integer", "minimum": 0}}}},
             "find": {"type": "array", "items": {"type": "object", "required": ["ref_id", "pattern"], "properties": {"ref_id": _REF, "pattern": _STRING}}},
-            "screenshot": {"type": "array", "items": {"type": "object", "required": ["ref_id", "pageno"], "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
+            "screenshot": {"type": "array", "description": "Open the PDF first, then reuse its returned ref_id in a later call in the same conversation.", "items": {"type": "object", "required": ["ref_id", "pageno"], "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
             "finance": {"type": "array", "items": {"type": "object", "required": ["ticker", "type"], "properties": {"ticker": _STRING, "type": {"type": "string", "enum": sorted(FINANCE_TYPES)}, "market": _STRING}}},
             "weather": {"type": "array", "items": {"type": "object", "required": ["location"], "properties": {"location": _STRING, "start": _STRING, "duration": {"type": "integer", "minimum": 0}}}},
             "sports": {"type": "array", "items": {"type": "object", "required": ["fn", "league"], "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "tool": {"type": "string", "enum": ["sports"]}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
