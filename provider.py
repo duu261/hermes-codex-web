@@ -402,10 +402,11 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
         "output": output,
         "results": results,
     }
-    if "encrypted_output" in data:
-        if not isinstance(data["encrypted_output"], str):
+    encrypted_output = data.get("encrypted_output")
+    if encrypted_output is not None:
+        if not isinstance(encrypted_output, str):
             return {"success": False, "error": "Codex Web returned invalid encrypted output"}
-        result["encrypted_output"] = data["encrypted_output"]
+        result["encrypted_output"] = encrypted_output
     return result
 
 
@@ -458,7 +459,7 @@ _QUERY = {
 _REF = {"type": "string", "minLength": 1}
 CODEX_WEB_SCHEMA = {
     "name": "codex_web",
-    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. For PDF screenshots, open the PDF first and reuse its returned ref_id. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
+    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. Compatible commands may be combined in one request. For PDF screenshots, open the PDF first and reuse its returned ref_id. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -473,7 +474,7 @@ CODEX_WEB_SCHEMA = {
             "screenshot": {"type": "array", "description": "Open the PDF first, then reuse its returned ref_id in a later call in the same conversation.", "items": {"type": "object", "required": ["ref_id", "pageno"], "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
             "finance": {"type": "array", "items": {"type": "object", "required": ["ticker", "type"], "properties": {"ticker": _STRING, "type": {"type": "string", "enum": sorted(FINANCE_TYPES)}, "market": _STRING}}},
             "weather": {"type": "array", "items": {"type": "object", "required": ["location"], "properties": {"location": _STRING, "start": _STRING, "duration": {"type": "integer", "minimum": 0}}}},
-            "sports": {"type": "array", "items": {"type": "object", "required": ["fn", "league"], "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "tool": {"type": "string", "enum": ["sports"]}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
+            "sports": {"type": "array", "items": {"type": "object", "required": ["fn", "league"], "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
             "time": {"type": "array", "items": {"type": "object", "required": ["utc_offset"], "properties": {"utc_offset": _STRING}}},
             "response_length": {"type": "string", "enum": sorted(RESPONSE_LENGTHS)},
             "search_context_size": {"type": "string", "enum": sorted(CONTEXT_SIZES)},

@@ -263,12 +263,19 @@ class CodexWebTests(unittest.TestCase):
             "error": "Codex Web returned an endpoint error",
         })
 
-    def test_schema_restricts_sports_tool_value_and_declares_url(self):
-        sports_tool = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]["sports"]["items"]["properties"]["tool"]
-        self.assertEqual(sports_tool["enum"], ["sports"])
+    def test_schema_declares_url_and_injects_sports_tool(self):
+        payload = provider.build_codex_web_payload(
+            {"sports": [{"fn": "schedule", "league": "nba"}]},
+            model="gpt-test",
+        )
+        self.assertEqual(payload["commands"]["sports"][0]["tool"], "sports")
         manifest = (ROOT / "plugin.yaml").read_text()
         self.assertIn("CODEX_WEB_BASE_URL", manifest)
         self.assertIn("CODEX_WEB_API_KEY", manifest)
+
+    def test_schema_hides_injected_sports_tool(self):
+        sports_properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]["sports"]["items"]["properties"]
+        self.assertNotIn("tool", sports_properties)
 
     def test_handler_preserves_structured_results_and_output(self):
         response = FakeResponse({
@@ -311,6 +318,52 @@ class CodexWebTests(unittest.TestCase):
 
         self.assertEqual(result["encrypted_output"], "opaque")
         self.assertEqual(result["results"], [])
+
+        for encrypted_output in (None,):
+            with patch.dict("os.environ", {
+                "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+                "CODEX_WEB_API_KEY": "secret",
+            }, clear=False), patch.object(
+                provider.urllib.request,
+                "urlopen",
+                return_value=FakeResponse({"encrypted_output": encrypted_output, "output": "text", "results": None}),
+            ):
+                result = json.loads(provider.handle_codex_web({
+                    "time": [{"utc_offset": "+07:00"}],
+                }))
+            self.assertTrue(result["success"])
+            self.assertNotIn("encrypted_output", result)
+            self.assertEqual(result["results"], [])
+
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False), patch.object(
+            provider.urllib.request,
+            "urlopen",
+            return_value=FakeResponse({"encrypted_output": 1, "output": "text"}),
+        ):
+            result = json.loads(provider.handle_codex_web({
+                "time": [{"utc_offset": "+07:00"}],
+            }))
+        self.assertEqual(result, {
+            "success": False,
+            "error": "Codex Web returned invalid encrypted output",
+        })
+
+    def test_handler_rejects_non_list_results(self):
+        response = FakeResponse({"output": "text", "results": {}})
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False), patch.object(provider.urllib.request, "urlopen", return_value=response):
+            result = json.loads(provider.handle_codex_web({
+                "time": [{"utc_offset": "+07:00"}],
+            }))
+        self.assertEqual(result, {
+            "success": False,
+            "error": "Codex Web returned no result list",
+        })
 
     def test_schema_exposes_all_endpoint_commands(self):
         properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
