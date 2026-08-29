@@ -194,12 +194,11 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
                 raise ValueError(f"sports[{index}].fn must be one of {sorted(SPORTS_FUNCTIONS)}")
             if league not in SPORTS_LEAGUES:
                 raise ValueError(f"sports[{index}].league must be one of {sorted(SPORTS_LEAGUES)}")
-            row: dict[str, Any] = {"fn": function, "league": league}
+            row: dict[str, Any] = {"tool": "sports", "fn": function, "league": league}
             if item.get("tool") is not None:
                 tool = _nonempty_string(item["tool"], f"sports[{index}].tool").lower()
                 if tool != "sports":
                     raise ValueError(f"sports[{index}].tool must be 'sports'")
-                row["tool"] = tool
             for key in ("team", "opponent", "date_from", "date_to", "locale"):
                 if item.get(key) is not None:
                     row[key] = _nonempty_string(item[key], f"sports[{index}].{key}")
@@ -335,6 +334,8 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "error": "Codex Web returned no result list"}
     if not isinstance(output, str):
         output = ""
+    if output.lstrip().startswith(("Error ", "Internal Error")):
+        return {"success": False, "error": "Codex Web returned an endpoint error"}
     return {
         "success": True,
         "output": output,

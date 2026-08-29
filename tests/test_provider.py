@@ -83,6 +83,7 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(payload["commands"]["click"], [{"ref_id": "turn0search0", "id": 3}])
         self.assertEqual(payload["commands"]["finance"][0]["type"], "equity")
         self.assertEqual(payload["commands"]["sports"][0]["fn"], "schedule")
+        self.assertEqual(payload["commands"]["sports"][0]["tool"], "sports")
         self.assertEqual(payload["commands"]["response_length"], "long")
         self.assertEqual(payload["settings"]["search_context_size"], "high")
         self.assertEqual(payload["settings"]["external_web_access"], "live")
@@ -142,6 +143,26 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(result, {
             "success": False,
             "error": "Codex Web returned no result list",
+        })
+
+    def test_handler_rejects_embedded_endpoint_errors(self):
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False), patch.object(
+            provider.urllib.request,
+            "urlopen",
+            return_value=FakeResponse({
+                "output": "Error parsing function call: invalid command",
+                "results": [],
+            }),
+        ):
+            result = json.loads(provider.handle_codex_web({
+                "sports": [{"fn": "schedule", "league": "nba"}],
+            }))
+        self.assertEqual(result, {
+            "success": False,
+            "error": "Codex Web returned an endpoint error",
         })
 
     def test_schema_restricts_sports_tool_value_and_declares_url(self):
