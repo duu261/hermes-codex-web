@@ -369,7 +369,7 @@ _QUERY = {
 _REF = {"type": "string", "minLength": 1}
 CODEX_WEB_SCHEMA = {
     "name": "codex_web",
-    "description": "Use the Codex web endpoint for search, images, page navigation, page finding, PDF screenshots, finance, weather, sports, and time. Return the endpoint result without inventing facts.",
+    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
     "parameters": {
         "type": "object",
         "properties": {
