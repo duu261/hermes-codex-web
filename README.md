@@ -176,6 +176,25 @@ open the official result, and find the section about free-threaded mode.
 
 Specialized commands can return useful text in `output` with an empty `results` list. HTTP 200 error text, missing result lists, malformed responses, and transport failures are returned as `success: false` instead of fake success.
 
+## Verified capability matrix
+
+The adapter has been exercised through the live Hermes tool path:
+
+| Capability | Status | Note |
+| --- | --- | --- |
+| `search_query` | Verified | Returns structured web results. |
+| `image_query` | Verified | Returns image findings in endpoint output. |
+| `open` | Verified | Opens a URL and returns page content. |
+| `find` | Verified | Finds text in a URL. |
+| `finance` | Verified | Specialized text output; `results` may be empty. |
+| `weather` | Verified | Specialized text output; `results` may be empty. |
+| `sports` | Verified | Adapter supplies the required `tool: "sports"` value. |
+| `time` | Verified | Specialized text output; `results` may be empty. |
+| `click` | Endpoint-dependent | Requires a valid reference ID and numbered link in the endpoint's request context. Stateless standalone calls may be rejected. |
+| `screenshot` | Endpoint-dependent | Requires a URL the endpoint fetches as `application/pdf`; deployments without PDF screenshot support reject it. |
+
+A `success: true` response is not claimed for an upstream error string. The adapter converts recognized HTTP-200 endpoint errors into `success: false`.
+
 ## Boundaries
 
 - This is an adapter around the endpoint, not the native Codex runtime.
