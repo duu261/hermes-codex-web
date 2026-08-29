@@ -1,0 +1,14 @@
+name: codex-web
+version: 0.1.0
+description: "Standalone Hermes tool for the Codex web command surface."
+author: Duu
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+provides_tools:
+  - codex_web
+requires_env:
+  - CODEX_WEB_BASE_URL
+  - CODEX_WEB_API_KEY
