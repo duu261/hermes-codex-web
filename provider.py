@@ -22,6 +22,8 @@ SPORTS_LEAGUES = {"nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb",
 RESPONSE_LENGTHS = {"short", "medium", "long"}
 CONTEXT_SIZES = {"low", "medium", "high"}
 ACCESS_MODES = {"cached", "indexed", "live"}
+REASONING_SUMMARIES = {"auto", "concise", "detailed", "none"}
+REASONING_CONTEXTS = {"auto", "current_turn", "all_turns"}
 
 
 def _env(name: str) -> str:
@@ -89,6 +91,35 @@ def _string_list(value: Any, field: str) -> list[str] | None:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
         raise ValueError(f"{field} must be a list of non-empty strings")
     return [item.strip() for item in value]
+
+
+def _input_value(value: Any) -> str | list[dict[str, Any]]:
+    if isinstance(value, str):
+        return _nonempty_string(value, "input")
+    if not isinstance(value, list) or not value or any(not isinstance(item, dict) for item in value):
+        raise ValueError("input must be a non-empty string or list of objects")
+    return value
+
+
+def _reasoning(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("reasoning must be a non-empty object")
+    result: dict[str, str] = {}
+    for key in ("effort", "summary", "context"):
+        item = value.get(key)
+        if item is None:
+            continue
+        item = _nonempty_string(item, f"reasoning.{key}")
+        if key != "effort":
+            item = item.lower()
+        if key == "summary" and item not in REASONING_SUMMARIES:
+            raise ValueError(f"reasoning.summary must be one of {sorted(REASONING_SUMMARIES)}")
+        if key == "context" and item not in REASONING_CONTEXTS:
+            raise ValueError(f"reasoning.context must be one of {sorted(REASONING_CONTEXTS)}")
+        result[key] = item
+    if not result or any(key not in {"effort", "summary", "context"} for key in value):
+        raise ValueError("reasoning supports only effort, summary, and context")
+    return result
 
 
 def _objects(value: Any, field: str) -> list[dict[str, Any]] | None:
@@ -304,8 +335,14 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
         "commands": commands,
         "settings": settings,
     }
-    if params.get("context") is not None:
+    if params.get("input") is not None and params.get("context") is not None:
+        raise ValueError("input and context cannot both be set")
+    if params.get("input") is not None:
+        payload["input"] = _input_value(params["input"])
+    elif params.get("context") is not None:
         payload["input"] = _nonempty_string(params["context"], "context")
+    if params.get("reasoning") is not None:
+        payload["reasoning"] = _reasoning(params["reasoning"])
     max_output_tokens = _optional_nonnegative_int(params.get("max_output_tokens"), "max_output_tokens")
     if max_output_tokens is not None:
         if max_output_tokens == 0:
@@ -333,6 +370,8 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "OpenAI-Beta": "responses=experimental",
+            "Originator": "codex_cli_rs",
         },
         method="POST",
     )
@@ -349,18 +388,25 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict) or data.get("error") is not None:
         return {"success": False, "error": "Codex Web returned an error"}
     output = data.get("output")
-    results = data.get("results")
+    results = data.get("results", [])
+    if results is None:
+        results = []
     if not isinstance(results, list):
         return {"success": False, "error": "Codex Web returned no result list"}
     if not isinstance(output, str):
         return {"success": False, "error": "Codex Web returned invalid output"}
     if output.lstrip().startswith(("Error ", "Internal Error")):
         return {"success": False, "error": "Codex Web returned an endpoint error"}
-    return {
+    result = {
         "success": True,
         "output": output,
         "results": results,
     }
+    if "encrypted_output" in data:
+        if not isinstance(data["encrypted_output"], str):
+            return {"success": False, "error": "Codex Web returned invalid encrypted output"}
+        result["encrypted_output"] = data["encrypted_output"]
+    return result
 
 
 def is_available() -> bool:
@@ -386,6 +432,23 @@ def handle_codex_web(params: dict[str, Any], **kwargs: Any) -> str:
 
 
 _STRING = {"type": "string"}
+_INPUT = {
+    "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    ],
+    "description": "Optional Codex input text or response-item objects.",
+}
+_REASONING = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "effort": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "enum": sorted(REASONING_SUMMARIES)},
+        "context": {"type": "string", "enum": sorted(REASONING_CONTEXTS)},
+    },
+    "minProperties": 1,
+}
 _QUERY = {
     "type": "array", "items": {"type": "object", "required": ["q"], "properties": {
         "q": _STRING, "recency": {"type": "integer", "minimum": 0},
@@ -400,6 +463,8 @@ CODEX_WEB_SCHEMA = {
         "type": "object",
         "properties": {
             "context": {"type": "string", "description": "Optional focused context for this web request."},
+            "input": _INPUT,
+            "reasoning": _REASONING,
             "search_query": _QUERY,
             "image_query": _QUERY,
             "open": {"type": "array", "items": {"type": "object", "required": ["ref_id"], "properties": {"ref_id": _REF, "lineno": {"type": "integer", "minimum": 0}}}},

@@ -44,6 +44,8 @@ This plugin does not modify Hermes core, replace `web_search`, run a second answ
 | `user_location` | Approximate `country`, `region`, `city`, and `timezone`. |
 | `max_output_tokens` | Positive output budget. |
 | `context` | Optional focused text input for the request. |
+| `input` | Optional Codex input text or response-item objects. Mutually exclusive with `context`. |
+| `reasoning` | Optional Codex reasoning object with `effort`, `summary`, and `context`. |
 
 The tool automatically sends `allowed_callers: ["direct"]` because Hermes invokes it directly. The routing model is configuration, not a tool argument.
 
@@ -176,7 +178,7 @@ open the official result, and find the section about free-threaded mode.
 }
 ```
 
-Specialized commands can return useful text in `output` with an empty `results` list. HTTP 200 error text, missing result lists, malformed responses, and transport failures are returned as `success: false` instead of fake success.
+Specialized commands can return useful text in `output` with an empty or omitted `results` list. HTTP 200 error text, malformed result lists, malformed responses, and transport failures are returned as `success: false` instead of fake success.
 
 ## Verified capability matrix
 
@@ -200,8 +202,8 @@ A `success: true` response is not claimed for an upstream error string. The adap
 ## Boundaries
 
 - This is an adapter around the endpoint, not the native Codex runtime.
-- Hermes does not provide native conversation-item input to plugin tools, so `context` is plain text only.
-- `reasoning` and native runtime headers are intentionally not exposed.
+- Hermes does not provide native conversation-item construction, but the plugin accepts raw Codex `input` response-item objects when supplied by the caller.
+- `reasoning` and raw `input` are supported; Codex-required headers are generated internally.
 - The plugin does not own a browser session; it preserves a bounded in-process Alpha Search request context per Hermes conversation for follow-up reference IDs. Context is lost after eviction or process restart.
 - Endpoint availability still depends on the configured gateway and its upstream account/pool permissions.
 - Command support is verified against the current endpoint path, but an upstream deployment may reject a command it has disabled.

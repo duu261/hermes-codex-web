@@ -98,6 +98,32 @@ class CodexWebTests(unittest.TestCase):
         })
         self.assertEqual(payload["max_output_tokens"], 2500)
 
+    def test_builds_codex_input_and_reasoning_fields(self):
+        input_items = [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Inspect this page"}],
+        }]
+        payload = provider.build_codex_web_payload(
+            {
+                "input": input_items,
+                "reasoning": {
+                    "effort": "high",
+                    "summary": "auto",
+                    "context": "current_turn",
+                },
+                "open": [{"ref_id": "https://example.com"}],
+            },
+            model="gpt-test",
+        )
+
+        self.assertEqual(payload["input"], input_items)
+        self.assertEqual(payload["reasoning"], {
+            "effort": "high",
+            "summary": "auto",
+            "context": "current_turn",
+        })
+
     def test_rejects_empty_command_request(self):
         with self.assertRaises(ValueError):
             provider.build_codex_web_payload({}, model="gpt-test")
@@ -183,7 +209,7 @@ class CodexWebTests(unittest.TestCase):
             )
             self.assertNotIn("session-0", provider._session_request_ids)
 
-    def test_handler_rejects_output_without_results(self):
+    def test_handler_defaults_missing_results_to_empty_list(self):
         with patch.dict("os.environ", {
             "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
             "CODEX_WEB_API_KEY": "secret",
@@ -193,12 +219,10 @@ class CodexWebTests(unittest.TestCase):
             return_value=FakeResponse({"output": "text only"}),
         ):
             result = json.loads(provider.handle_codex_web({
-                "search_query": [{"q": "test"}],
+                "time": [{"utc_offset": "+07:00"}],
             }))
-        self.assertEqual(result, {
-            "success": False,
-            "error": "Codex Web returned no result list",
-        })
+        self.assertEqual(result["success"], True)
+        self.assertEqual(result["results"], [])
 
     def test_handler_rejects_missing_or_non_string_output(self):
         with patch.dict("os.environ", {
@@ -266,14 +290,32 @@ class CodexWebTests(unittest.TestCase):
 
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "https://gateway.example/v1/alpha/search")
+        self.assertEqual(request.get_header("Openai-beta"), "responses=experimental")
+        self.assertEqual(request.get_header("Originator"), "codex_cli_rs")
         self.assertEqual(result["success"], True)
         self.assertEqual(result["output"], "Opened page content")
         self.assertEqual(result["results"][0]["ref_id"], "turn0search0")
 
+    def test_handler_preserves_encrypted_output_and_optional_results(self):
+        response = FakeResponse({
+            "encrypted_output": "opaque",
+            "output": "Specialized result",
+        })
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False), patch.object(provider.urllib.request, "urlopen", return_value=response):
+            result = json.loads(provider.handle_codex_web({
+                "time": [{"utc_offset": "+07:00"}],
+            }))
+
+        self.assertEqual(result["encrypted_output"], "opaque")
+        self.assertEqual(result["results"], [])
+
     def test_schema_exposes_all_endpoint_commands(self):
         properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
         expected = {
-            "context", "search_query", "image_query", "open", "click", "find",
+            "context", "input", "reasoning", "search_query", "image_query", "open", "click", "find",
             "screenshot", "finance", "weather", "sports", "time", "response_length",
             "search_context_size", "allowed_domains", "blocked_domains", "image_settings",
             "external_web_access", "max_output_tokens", "user_location",
