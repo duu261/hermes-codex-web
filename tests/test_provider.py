@@ -128,6 +128,33 @@ class CodexWebTests(unittest.TestCase):
         }, model="gpt-test")
         self.assertEqual(payload["commands"]["finance"][0]["market"], "")
 
+    def test_handler_reuses_request_id_for_hermes_session(self):
+        responses = [
+            FakeResponse({"output": "Opened PDF", "results": [{"ref_id": "turn0view0"}]}),
+            FakeResponse({"output": "Screenshot result", "results": []}),
+        ]
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False), patch.object(
+            provider.urllib.request,
+            "urlopen",
+            side_effect=responses,
+        ) as open_url:
+            provider.handle_codex_web(
+                {"open": [{"ref_id": "https://example.com/document.pdf"}]},
+                session_id="hermes-session",
+            )
+            provider.handle_codex_web(
+                {"screenshot": [{"ref_id": "turn0view0", "pageno": 0}]},
+                session_id="hermes-session",
+            )
+
+        request_ids = [json.loads(call.args[0].data)["id"] for call in open_url.call_args_list]
+        self.assertEqual(request_ids[0], request_ids[1])
+
+        provider._session_request_id.cache_clear()
+
     def test_handler_rejects_output_without_results(self):
         with patch.dict("os.environ", {
             "CODEX_WEB_BASE_URL": "https://gateway.example/v1",

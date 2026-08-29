@@ -7,6 +7,7 @@ import os
 import urllib.error
 import urllib.request
 import uuid
+from functools import lru_cache
 from typing import Any
 
 DEFAULT_MODEL = "gpt-5.4-mini"
@@ -47,6 +48,11 @@ def _model() -> str:
     except Exception:
         pass
     return DEFAULT_MODEL
+
+
+@lru_cache(maxsize=1024)
+def _session_request_id(session_id: str) -> str:
+    return str(uuid.uuid4())
 
 
 def _nonempty_string(value: Any, field: str) -> str:
@@ -348,11 +354,17 @@ def is_available() -> bool:
 
 
 def handle_codex_web(params: dict[str, Any], **kwargs: Any) -> str:
-    del kwargs
     try:
+        session_id = kwargs.get("session_id")
+        request_id = (
+            _session_request_id(session_id.strip())
+            if isinstance(session_id, str) and session_id.strip()
+            else None
+        )
         payload = build_codex_web_payload(
             params,
             model=_model(),
+            request_id=request_id,
         )
         return json.dumps(_post(payload), ensure_ascii=False)
     except (TypeError, ValueError) as exc:
@@ -369,7 +381,7 @@ _QUERY = {
 _REF = {"type": "string", "minLength": 1}
 CODEX_WEB_SCHEMA = {
     "name": "codex_web",
-    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
+    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. For PDF screenshots, open the PDF first and reuse its returned ref_id. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -101,6 +101,8 @@ codex_web with screenshot
 codex_web with finance, weather, sports, or time
 ```
 
+For PDF screenshots, call `open` first, then call `screenshot` with the returned `ref_id` in the same conversation. The plugin reuses the Codex request ID per Hermes session so the upstream page context is preserved.
+
 The model can discover the tool from its schema, but explicit wording is safest when a specific command is required:
 
 ```text
