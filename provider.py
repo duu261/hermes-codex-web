@@ -333,7 +333,7 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(results, list):
         return {"success": False, "error": "Codex Web returned no result list"}
     if not isinstance(output, str):
-        output = ""
+        return {"success": False, "error": "Codex Web returned invalid output"}
     if output.lstrip().startswith(("Error ", "Internal Error")):
         return {"success": False, "error": "Codex Web returned an endpoint error"}
     return {

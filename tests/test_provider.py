@@ -145,6 +145,25 @@ class CodexWebTests(unittest.TestCase):
             "error": "Codex Web returned no result list",
         })
 
+    def test_handler_rejects_missing_or_non_string_output(self):
+        with patch.dict("os.environ", {
+            "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
+            "CODEX_WEB_API_KEY": "secret",
+        }, clear=False):
+            for response_payload in ({"results": []}, {"output": None, "results": []}):
+                with self.subTest(response_payload=response_payload), patch.object(
+                    provider.urllib.request,
+                    "urlopen",
+                    return_value=FakeResponse(response_payload),
+                ):
+                    result = json.loads(provider.handle_codex_web({
+                        "search_query": [{"q": "test"}],
+                    }))
+                self.assertEqual(result, {
+                    "success": False,
+                    "error": "Codex Web returned invalid output",
+                })
+
     def test_handler_rejects_embedded_endpoint_errors(self):
         with patch.dict("os.environ", {
             "CODEX_WEB_BASE_URL": "https://gateway.example/v1",
