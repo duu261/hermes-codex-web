@@ -1,21 +1,30 @@
-"""Standalone Hermes tool for the Codex alpha web-search command surface."""
+"""Standalone Hermes tool for the Codex web command surface."""
 
 from __future__ import annotations
 
+import email.utils
 import json
 import os
+import random
+import re
+import socket
+import time
 import urllib.error
 import urllib.request
 import uuid
 from collections import OrderedDict
-from threading import Lock
+from dataclasses import dataclass, field
+from datetime import timezone
+from threading import RLock
 from typing import Any
+from urllib.parse import urlparse
 
 DEFAULT_MODEL = "gpt-5.4-mini"
 COMMAND_KEYS = (
     "search_query", "image_query", "open", "click", "find", "screenshot",
     "finance", "weather", "sports", "time",
 )
+
 FINANCE_TYPES = {"equity", "fund", "crypto", "index"}
 SPORTS_FUNCTIONS = {"schedule", "standings"}
 SPORTS_LEAGUES = {"nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"}
@@ -24,6 +33,27 @@ CONTEXT_SIZES = {"low", "medium", "high"}
 ACCESS_MODES = {"cached", "indexed", "live"}
 REASONING_SUMMARIES = {"auto", "concise", "detailed", "none"}
 REASONING_CONTEXTS = {"auto", "current_turn", "all_turns"}
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_SESSION_TTL_SECONDS = 30 * 60
+DEFAULT_MAX_SESSIONS = 1024
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+class _ValidationError(ValueError):
+    pass
+
+
+class _ReferenceExpiredError(ValueError):
+    pass
+
+
+@dataclass
+class _ConversationState:
+    request_id: str
+    expires_at: float
+    refs: set[str] = field(default_factory=set)
 
 
 def _env(name: str) -> str:
@@ -40,40 +70,99 @@ def _setting(name: str) -> str:
     return _env(name) or _env(f"CODEX_SEARCH_{suffix}")
 
 
-def _model() -> str:
+def _config() -> dict[str, Any]:
     try:
-        from hermes_cli.config import load_config
-
-        config = load_config() or {}
-        value = (config.get("web") or {}).get("codex_web", {}).get("model")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        from hermes_cli.config import load_config_readonly
+        loaded = load_config_readonly()
+    except (ImportError, AttributeError):
+        try:
+            from hermes_cli.config import load_config
+            loaded = load_config()
+        except Exception:
+            return {}
     except Exception:
-        pass
-    return DEFAULT_MODEL
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    web = loaded.get("web")
+    codex = web.get("codex_web") if isinstance(web, dict) else None
+    return codex if isinstance(codex, dict) else {}
 
 
-_SESSION_REQUEST_ID_LIMIT = 1024
-_session_request_ids: OrderedDict[str, str] = OrderedDict()
-_session_request_ids_lock = Lock()
+def _numeric_setting(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    value = _config().get(name, default)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if value != value:
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _integer_setting(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    value = _config().get(name, default)
+    if isinstance(value, bool):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+_sessions: OrderedDict[str, _ConversationState] = OrderedDict()
+_sessions_lock = RLock()
+
+
+def _expire_sessions_locked(now: float) -> None:
+    expired = [key for key, state in _sessions.items() if state.expires_at <= now]
+    for key in expired:
+        _sessions.pop(key, None)
+
+
+def clear_session_state() -> None:
+    """Clear process-local continuation state, primarily for tests and shutdown."""
+    with _sessions_lock:
+        _sessions.clear()
+
+
+def _session_state(session_id: str, *, create: bool) -> _ConversationState | None:
+    now = time.monotonic()
+    with _sessions_lock:
+        _expire_sessions_locked(now)
+        state = _sessions.get(session_id)
+        if state is not None:
+            state.expires_at = now + _numeric_setting(
+                "session_ttl_seconds", DEFAULT_SESSION_TTL_SECONDS,
+                minimum=1.0, maximum=24 * 60 * 60,
+            )
+            _sessions.move_to_end(session_id)
+            return state
+        if not create:
+            return None
+        state = _ConversationState(
+            request_id=str(uuid.uuid4()),
+            expires_at=now + _numeric_setting(
+                "session_ttl_seconds", DEFAULT_SESSION_TTL_SECONDS,
+                minimum=1.0, maximum=24 * 60 * 60,
+            ),
+        )
+        _sessions[session_id] = state
+        limit = _integer_setting("max_sessions", DEFAULT_MAX_SESSIONS, minimum=1, maximum=10000)
+        while len(_sessions) > limit:
+            _sessions.popitem(last=False)
+        return state
 
 
 def _session_request_id(session_id: str) -> str:
-    with _session_request_ids_lock:
-        request_id = _session_request_ids.get(session_id)
-        if request_id is None:
-            request_id = str(uuid.uuid4())
-            _session_request_ids[session_id] = request_id
-            if len(_session_request_ids) > _SESSION_REQUEST_ID_LIMIT:
-                _session_request_ids.popitem(last=False)
-        else:
-            _session_request_ids.move_to_end(session_id)
-        return request_id
+    """Return the stable upstream request id for one Hermes conversation."""
+    return _session_state(session_id, create=True).request_id
 
 
 def _nonempty_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field} must be a non-empty string")
+        raise _ValidationError(f"{field} must be a non-empty string")
     return value.strip()
 
 
@@ -81,7 +170,7 @@ def _optional_nonnegative_int(value: Any, field: str) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer")
+        raise _ValidationError(f"{field} must be a non-negative integer")
     return value
 
 
@@ -89,7 +178,7 @@ def _string_list(value: Any, field: str) -> list[str] | None:
     if value is None:
         return None
     if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
-        raise ValueError(f"{field} must be a list of non-empty strings")
+        raise _ValidationError(f"{field} must be a list of non-empty strings")
     return [item.strip() for item in value]
 
 
@@ -97,13 +186,13 @@ def _input_value(value: Any) -> str | list[dict[str, Any]]:
     if isinstance(value, str):
         return _nonempty_string(value, "input")
     if not isinstance(value, list) or not value or any(not isinstance(item, dict) for item in value):
-        raise ValueError("input must be a non-empty string or list of objects")
+        raise _ValidationError("input must be a non-empty string or list of objects")
     return value
 
 
 def _reasoning(value: Any) -> dict[str, str]:
     if not isinstance(value, dict) or not value:
-        raise ValueError("reasoning must be a non-empty object")
+        raise _ValidationError("reasoning must be a non-empty object")
     result: dict[str, str] = {}
     for key in ("effort", "summary", "context"):
         item = value.get(key)
@@ -113,12 +202,12 @@ def _reasoning(value: Any) -> dict[str, str]:
         if key != "effort":
             item = item.lower()
         if key == "summary" and item not in REASONING_SUMMARIES:
-            raise ValueError(f"reasoning.summary must be one of {sorted(REASONING_SUMMARIES)}")
+            raise _ValidationError(f"reasoning.summary must be one of {sorted(REASONING_SUMMARIES)}")
         if key == "context" and item not in REASONING_CONTEXTS:
-            raise ValueError(f"reasoning.context must be one of {sorted(REASONING_CONTEXTS)}")
+            raise _ValidationError(f"reasoning.context must be one of {sorted(REASONING_CONTEXTS)}")
         result[key] = item
     if not result or any(key not in {"effort", "summary", "context"} for key in value):
-        raise ValueError("reasoning supports only effort, summary, and context")
+        raise _ValidationError("reasoning supports only effort, summary, and context")
     return result
 
 
@@ -126,7 +215,7 @@ def _objects(value: Any, field: str) -> list[dict[str, Any]] | None:
     if value is None:
         return None
     if not isinstance(value, list) or not value or any(not isinstance(item, dict) for item in value):
-        raise ValueError(f"{field} must be a non-empty list of objects")
+        raise _ValidationError(f"{field} must be a non-empty list of objects")
     return value
 
 
@@ -135,7 +224,7 @@ def _query_list(value: Any, field: str) -> list[dict[str, Any]] | None:
     if rows is None:
         return None
     if field == "search_query" and len(rows) > 4:
-        raise ValueError("search_query supports at most 4 queries")
+        raise _ValidationError("search_query supports at most 4 queries")
     result = []
     for index, item in enumerate(rows):
         row = {"q": _nonempty_string(item.get("q"), f"{field}[{index}].q")}
@@ -186,7 +275,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
         for index, item in enumerate(rows):
             pageno = _optional_nonnegative_int(item.get("pageno"), f"screenshot[{index}].pageno")
             if pageno is None:
-                raise ValueError(f"screenshot[{index}].pageno is required")
+                raise _ValidationError(f"screenshot[{index}].pageno is required")
             commands["screenshot"].append({
                 "ref_id": _nonempty_string(item.get("ref_id"), f"screenshot[{index}].ref_id"),
                 "pageno": pageno,
@@ -198,7 +287,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
         for index, item in enumerate(rows):
             link_id = _optional_nonnegative_int(item.get("id"), f"click[{index}].id")
             if link_id is None:
-                raise ValueError(f"click[{index}].id is required")
+                raise _ValidationError(f"click[{index}].id is required")
             commands["click"].append({
                 "ref_id": _nonempty_string(item.get("ref_id"), f"click[{index}].ref_id"),
                 "id": link_id,
@@ -210,7 +299,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
         for index, item in enumerate(rows):
             asset_type = _nonempty_string(item.get("type"), f"finance[{index}].type").lower()
             if asset_type not in FINANCE_TYPES:
-                raise ValueError(f"finance[{index}].type must be one of {sorted(FINANCE_TYPES)}")
+                raise _ValidationError(f"finance[{index}].type must be one of {sorted(FINANCE_TYPES)}")
             row = {
                 "ticker": _nonempty_string(item.get("ticker"), f"finance[{index}].ticker"),
                 "type": asset_type,
@@ -233,7 +322,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
             duration = _optional_nonnegative_int(item.get("duration"), f"weather[{index}].duration")
             if duration is not None:
                 row["duration"] = duration
-            commands["weather"].append(row)
+            commands["weather"] = commands.get("weather", []) + [row]
 
     rows = _objects(params.get("sports"), "sports")
     if rows is not None:
@@ -242,38 +331,37 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
             function = _nonempty_string(item.get("fn"), f"sports[{index}].fn").lower()
             league = _nonempty_string(item.get("league"), f"sports[{index}].league").lower()
             if function not in SPORTS_FUNCTIONS:
-                raise ValueError(f"sports[{index}].fn must be one of {sorted(SPORTS_FUNCTIONS)}")
+                raise _ValidationError(f"sports[{index}].fn must be one of {sorted(SPORTS_FUNCTIONS)}")
             if league not in SPORTS_LEAGUES:
-                raise ValueError(f"sports[{index}].league must be one of {sorted(SPORTS_LEAGUES)}")
+                raise _ValidationError(f"sports[{index}].league must be one of {sorted(SPORTS_LEAGUES)}")
             row: dict[str, Any] = {"tool": "sports", "fn": function, "league": league}
             if item.get("tool") is not None:
                 tool = _nonempty_string(item["tool"], f"sports[{index}].tool").lower()
                 if tool != "sports":
-                    raise ValueError(f"sports[{index}].tool must be 'sports'")
+                    raise _ValidationError(f"sports[{index}].tool must be 'sports'")
             for key in ("team", "opponent", "date_from", "date_to", "locale"):
                 if item.get(key) is not None:
                     row[key] = _nonempty_string(item[key], f"sports[{index}].{key}")
-            for key in ("num_games",):
-                number = _optional_nonnegative_int(item.get(key), f"sports[{index}].{key}")
-                if number is not None:
-                    row[key] = number
+            number = _optional_nonnegative_int(item.get("num_games"), f"sports[{index}].num_games")
+            if number is not None:
+                row["num_games"] = number
             commands["sports"].append(row)
     return commands
 
 
 def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: str | None = None) -> dict[str, Any]:
     if not isinstance(params, dict):
-        raise ValueError("parameters must be an object")
+        raise _ValidationError("parameters must be an object")
     commands = _validate_special_operations(params)
     if not any(key in commands for key in COMMAND_KEYS):
-        raise ValueError("at least one web command is required")
+        raise _ValidationError("at least one web command is required")
     response_length = params.get("response_length")
     if response_length is not None:
         response_length = _nonempty_string(response_length, "response_length").lower()
         if response_length not in RESPONSE_LENGTHS:
-            raise ValueError(f"response_length must be one of {sorted(RESPONSE_LENGTHS)}")
+            raise _ValidationError(f"response_length must be one of {sorted(RESPONSE_LENGTHS)}")
     if len(commands.get("search_query", [])) > 3 and response_length not in {"medium", "long"}:
-        raise ValueError("response_length must be medium or long for more than 3 search queries")
+        raise _ValidationError("response_length must be medium or long for more than 3 search queries")
     if response_length is not None:
         commands["response_length"] = response_length
 
@@ -285,7 +373,7 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
     if context_size is not None:
         context_size = _nonempty_string(context_size, "search_context_size").lower()
         if context_size not in CONTEXT_SIZES:
-            raise ValueError(f"search_context_size must be one of {sorted(CONTEXT_SIZES)}")
+            raise _ValidationError(f"search_context_size must be one of {sorted(CONTEXT_SIZES)}")
         settings["search_context_size"] = context_size
 
     for key in ("allowed_domains", "blocked_domains"):
@@ -296,17 +384,17 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
     image_settings = params.get("image_settings")
     if image_settings is not None:
         if not isinstance(image_settings, dict):
-            raise ValueError("image_settings must be an object")
+            raise _ValidationError("image_settings must be an object")
         image_payload: dict[str, Any] = {}
         max_results = _optional_nonnegative_int(image_settings.get("max_results"), "image_settings.max_results")
         if max_results is not None:
             image_payload["max_results"] = max_results
         if image_settings.get("caption") is not None:
             if not isinstance(image_settings["caption"], bool):
-                raise ValueError("image_settings.caption must be boolean")
+                raise _ValidationError("image_settings.caption must be boolean")
             image_payload["caption"] = image_settings["caption"]
         if not image_payload:
-            raise ValueError("image_settings must contain max_results or caption")
+            raise _ValidationError("image_settings must contain max_results or caption")
         settings["image_settings"] = image_payload
 
     access = params.get("external_web_access")
@@ -316,13 +404,13 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
         else:
             access = _nonempty_string(access, "external_web_access").lower()
             if access not in ACCESS_MODES:
-                raise ValueError(f"external_web_access must be boolean or one of {sorted(ACCESS_MODES)}")
+                raise _ValidationError(f"external_web_access must be boolean or one of {sorted(ACCESS_MODES)}")
             settings["external_web_access"] = access
 
     location = params.get("user_location")
     if location is not None:
         if not isinstance(location, dict):
-            raise ValueError("user_location must be an object")
+            raise _ValidationError("user_location must be an object")
         location_payload = {"type": "approximate"}
         for key in ("country", "region", "city", "timezone"):
             if location.get(key) is not None:
@@ -336,7 +424,7 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
         "settings": settings,
     }
     if params.get("input") is not None and params.get("context") is not None:
-        raise ValueError("input and context cannot both be set")
+        raise _ValidationError("input and context cannot both be set")
     if params.get("input") is not None:
         payload["input"] = _input_value(params["input"])
     elif params.get("context") is not None:
@@ -346,7 +434,7 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
     max_output_tokens = _optional_nonnegative_int(params.get("max_output_tokens"), "max_output_tokens")
     if max_output_tokens is not None:
         if max_output_tokens == 0:
-            raise ValueError("max_output_tokens must be greater than zero")
+            raise _ValidationError("max_output_tokens must be greater than zero")
         payload["max_output_tokens"] = max_output_tokens
     return payload
 
@@ -356,15 +444,228 @@ def _endpoint(base_url: str) -> str:
     return base_url if base_url.endswith("/alpha/search") else f"{base_url}/alpha/search"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward a bearer credential to a redirected origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_request(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
+def _header(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+        if value is None:
+            wanted = name.lower()
+            for key, candidate in headers.items():
+                if str(key).lower() == wanted:
+                    value = candidate
+                    break
+    except AttributeError:
+        return None
+    return str(value).strip() if value else None
+
+
+def _request_id(headers: Any, payload: Any = None) -> str | None:
+    for name in ("x-request-id", "request-id", "x-openai-request-id"):
+        value = _header(headers, name)
+        if value:
+            return value[:200]
+    if isinstance(payload, dict):
+        value = payload.get("request_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:200]
+    return None
+
+
+def _safe_message(value: Any, default: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return default
+    message = value.strip()
+    if re.search(r"(?i)(secret|password|credential|authorization|api[_ -]?key|access[_ -]?token)", message):
+        return default
+    message = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", message)
+    message = re.sub(r"(?i)(?:sk|pk|api|key|token)[-_][A-Za-z0-9._~-]+", "[redacted]", message)
+    message = re.sub(r"https?://[^\s)]+", "[redacted-url]", message)
+    message = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[redacted-email]", message)
+    return message[:500]
+
+
+def _error(error_type: str, message: str, *, status: int | None = None, request_id: str | None = None) -> dict[str, Any]:
+    details: dict[str, Any] = {"type": error_type, "message": str(message)[:500]}
+    if status is not None:
+        details["status"] = status
+    if request_id:
+        details["request_id"] = request_id
+    return {"success": False, "error": details}
+
+
+def _attach_request_id(result: dict[str, Any], request_id: str | None) -> dict[str, Any]:
+    if request_id and isinstance(result.get("error"), dict):
+        result["error"].setdefault("request_id", request_id)
+    return result
+
+
+def _error_message_from_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return _safe_message(error.get("message") or error.get("detail"), "Codex Web returned an error")
+        if isinstance(error, str):
+            return _safe_message(error, "Codex Web returned an error")
+        return _safe_message(payload.get("message"), "Codex Web returned an error")
+    if isinstance(payload, str):
+        return _safe_message(payload, "Codex Web returned an error")
+    return "Codex Web returned an error"
+
+
+def _read_limited(response: Any, limit: int) -> tuple[bytes | None, bool]:
+    length = _header(getattr(response, "headers", None), "content-length")
+    if length:
+        try:
+            if int(length) > limit:
+                return None, True
+        except ValueError:
+            pass
+    try:
+        body = response.read(limit + 1)
+    except TypeError:
+        body = response.read()
+    if not isinstance(body, (bytes, bytearray)):
+        return None, False
+    if len(body) > limit:
+        return None, True
+    return bytes(body), False
+
+
+def _parse_response_body(response: Any, limit: int) -> tuple[Any, dict[str, Any] | None]:
+    body, oversized = _read_limited(response, limit)
+    if oversized:
+        return None, _error("response_too_large", "Codex Web response exceeded the configured size limit")
+    if body is None:
+        return None, _error("malformed_response", "Codex Web returned a non-byte response body")
+    try:
+        return json.loads(body.decode("utf-8")), None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, _error("malformed_response", "Codex Web returned invalid JSON")
+
+
+def _retry_after(headers: Any, now: float | None = None) -> float | None:
+    value = _header(headers, "retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            target = email.utils.parsedate_to_datetime(value)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            return max(0.0, target.timestamp() - (time.time() if now is None else now))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _retry_delay(headers: Any, attempt: int) -> float:
+    retry_after = _retry_after(headers)
+    backoff = min(10.0, _numeric_setting("retry_base_seconds", 0.25, minimum=0.0, maximum=10.0) * (2 ** attempt))
+    jitter = random.uniform(0.0, min(1.0, max(backoff, 0.01)))
+    return max(retry_after or 0.0, backoff) + jitter if retry_after is None else retry_after + jitter
+
+
+def _http_failure(exc: urllib.error.HTTPError, limit: int) -> tuple[str, int | None, str | None]:
+    headers = getattr(exc, "headers", None)
+    request_id = _request_id(headers)
+    payload = None
+    try:
+        body, oversized = _read_limited(exc, limit)
+        if not oversized and body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = body.decode("utf-8", errors="replace")
+    except Exception:
+        payload = None
+    return _error_message_from_payload(payload), int(exc.code), request_id
+
+
+def _classify_status(status: int) -> str:
+    if status in {401, 403}:
+        return "authentication"
+    if status in {402, 403}:
+        return "quota"
+    if status == 429:
+        return "rate_limit"
+    if 400 <= status < 500:
+        return "upstream"
+    return "upstream"
+
+
+def _normalize_success(data: Any, request_id: str | None = None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return _error("malformed_response", "Codex Web returned a JSON value instead of an object")
+    if data.get("error") is not None:
+        return _error("upstream", _error_message_from_payload(data), request_id=request_id or _request_id(None, data))
+    output = data.get("output")
+    results = data.get("results", [])
+    if results is None:
+        results = []
+    if not isinstance(results, list):
+        return _error("malformed_response", "Codex Web returned no result list")
+    if not isinstance(output, str):
+        return _error("malformed_response", "Codex Web returned invalid output")
+    if output.lstrip().startswith(("Error ", "Internal Error")):
+        return _error("upstream", "Codex Web returned an endpoint error")
+
+    sources = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        source: dict[str, Any] = {"url": url}
+        for key in ("ref_id", "title"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                source[key] = value
+        item_type = item.get("type")
+        source["type"] = "image" if isinstance(item_type, str) and "image" in item_type.lower() else "web"
+        sources.append(source)
+
+    result: dict[str, Any] = {
+        "success": True,
+        "output": output,
+        "results": results,
+        "sources": sources,
+    }
+    encrypted_output = data.get("encrypted_output")
+    if encrypted_output is not None:
+        if not isinstance(encrypted_output, str):
+            return _error("malformed_response", "Codex Web returned invalid encrypted output")
+        result["encrypted_output"] = encrypted_output
+    return result
+
+
 def _post(payload: dict[str, Any]) -> dict[str, Any]:
     base_url = _setting("CODEX_WEB_BASE_URL")
     api_key = _setting("CODEX_WEB_API_KEY")
     if not base_url:
-        return {"success": False, "error": "CODEX_WEB_BASE_URL is not set"}
+        return _error("configuration", "CODEX_WEB_BASE_URL is not set")
     if not api_key:
-        return {"success": False, "error": "CODEX_WEB_API_KEY is not set"}
+        return _error("authentication", "CODEX_WEB_API_KEY is not set")
+    endpoint = _endpoint(base_url)
+    if urlparse(endpoint).scheme != "https":
+        return _error("configuration", "CODEX_WEB_BASE_URL must use HTTPS")
+
     request = urllib.request.Request(
-        _endpoint(base_url),
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Accept": "application/json",
@@ -375,39 +676,74 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return {"success": False, "error": f"Codex Web returned HTTP {exc.code}"}
-    except (urllib.error.URLError, TimeoutError):
-        return {"success": False, "error": "Could not reach Codex Web"}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {"success": False, "error": "Codex Web returned invalid JSON"}
+    max_retries = _integer_setting("max_retries", DEFAULT_MAX_RETRIES, minimum=0, maximum=5)
+    timeout = _numeric_setting("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS, minimum=0.1, maximum=600.0)
+    max_response_bytes = _integer_setting("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES, minimum=1, maximum=64 * 1024 * 1024)
 
-    if not isinstance(data, dict) or data.get("error") is not None:
-        return {"success": False, "error": "Codex Web returned an error"}
-    output = data.get("output")
-    results = data.get("results", [])
-    if results is None:
-        results = []
-    if not isinstance(results, list):
-        return {"success": False, "error": "Codex Web returned no result list"}
-    if not isinstance(output, str):
-        return {"success": False, "error": "Codex Web returned invalid output"}
-    if output.lstrip().startswith(("Error ", "Internal Error")):
-        return {"success": False, "error": "Codex Web returned an endpoint error"}
-    result = {
-        "success": True,
-        "output": output,
-        "results": results,
-    }
-    encrypted_output = data.get("encrypted_output")
-    if encrypted_output is not None:
-        if not isinstance(encrypted_output, str):
-            return {"success": False, "error": "Codex Web returned invalid encrypted output"}
-        result["encrypted_output"] = encrypted_output
-    return result
+    for attempt in range(max_retries + 1):
+        try:
+            with _open_request(request, timeout=timeout) as response:
+                data, error = _parse_response_body(response, max_response_bytes)
+                if error is not None:
+                    return _attach_request_id(error, _request_id(getattr(response, "headers", None)))
+                return _normalize_success(data, _request_id(getattr(response, "headers", None)))
+        except urllib.error.HTTPError as exc:
+            message, status, upstream_request_id = _http_failure(exc, max_response_bytes)
+            if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
+                time.sleep(_retry_delay(getattr(exc, "headers", None), attempt))
+                continue
+            return _error(_classify_status(status or 0), message, status=status, request_id=upstream_request_id)
+        except (socket.timeout, TimeoutError):
+            return _error("timeout", "Codex Web request timed out")
+        except urllib.error.URLError:
+            return _error("upstream", "Could not reach Codex Web")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error("malformed_response", "Codex Web returned invalid JSON")
+        except OSError:
+            return _error("upstream", "Could not reach Codex Web")
+    return _error("upstream", "Codex Web request failed")
+
+
+def _is_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _reference_values(params: dict[str, Any]) -> list[str]:
+    values = []
+    for key in ("open", "find", "click", "screenshot"):
+        for item in params.get(key) or []:
+            if isinstance(item, dict) and isinstance(item.get("ref_id"), str):
+                values.append(item["ref_id"].strip())
+    return values
+
+
+def _validate_continuation(params: dict[str, Any], session_id: str | None) -> _ConversationState | None:
+    refs = [ref for ref in _reference_values(params) if not _is_url(ref)]
+    if not refs:
+        return _session_state(session_id, create=True) if session_id else None
+    if not session_id:
+        raise _ReferenceExpiredError("reference continuation requires a Hermes conversation")
+    state = _session_state(session_id, create=False)
+    if state is None:
+        raise _ReferenceExpiredError("reference expired; repeat the search or open the URL again")
+    with _sessions_lock:
+        missing = [ref for ref in refs if ref not in state.refs]
+    if missing:
+        raise _ReferenceExpiredError("reference is unknown or expired; repeat the search or open the URL again")
+    return state
+
+
+def _record_refs(state: _ConversationState | None, result: dict[str, Any]) -> None:
+    if state is None or not result.get("success"):
+        return
+    refs = set()
+    for item in result.get("results", []):
+        if isinstance(item, dict) and isinstance(item.get("ref_id"), str) and item["ref_id"].strip():
+            refs.add(item["ref_id"].strip())
+    if refs:
+        with _sessions_lock:
+            state.refs.update(refs)
 
 
 def is_available() -> bool:
@@ -416,74 +752,54 @@ def is_available() -> bool:
 
 def handle_codex_web(params: dict[str, Any], **kwargs: Any) -> str:
     try:
+        if not isinstance(params, dict):
+            raise _ValidationError("parameters must be an object")
         session_id = kwargs.get("session_id")
-        request_id = (
-            _session_request_id(session_id.strip())
-            if isinstance(session_id, str) and session_id.strip()
-            else None
-        )
-        payload = build_codex_web_payload(
-            params,
-            model=_model(),
-            request_id=request_id,
-        )
-        return json.dumps(_post(payload), ensure_ascii=False)
+        session_id = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        state = _validate_continuation(params, session_id)
+        request_id = state.request_id if state is not None else None
+        payload = build_codex_web_payload(params, model=_model(), request_id=request_id)
+        result = _post(payload)
+        _record_refs(state, result)
+        return json.dumps(result, ensure_ascii=False)
+    except _ReferenceExpiredError as exc:
+        return json.dumps(_error("reference_expired", str(exc)), ensure_ascii=False)
     except (TypeError, ValueError) as exc:
-        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+        return json.dumps(_error("validation", str(exc)), ensure_ascii=False)
 
 
-_STRING = {"type": "string"}
-_INPUT = {
-    "oneOf": [
-        {"type": "string", "minLength": 1},
-        {"type": "array", "minItems": 1, "items": {"type": "object"}},
-    ],
-    "description": "Optional Codex input text or response-item objects.",
-}
-_REASONING = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "effort": {"type": "string", "minLength": 1},
-        "summary": {"type": "string", "enum": sorted(REASONING_SUMMARIES)},
-        "context": {"type": "string", "enum": sorted(REASONING_CONTEXTS)},
-    },
-    "minProperties": 1,
-}
+def _model() -> str:
+    value = _config().get("model")
+    return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_MODEL
+
+
+_STRING = {"type": "string", "minLength": 1}
+_REF = {"type": "string", "minLength": 1}
 _QUERY = {
-    "type": "array", "items": {"type": "object", "required": ["q"], "properties": {
+    "type": "array", "minItems": 1,
+    "items": {"type": "object", "required": ["q"], "additionalProperties": False, "properties": {
         "q": _STRING, "recency": {"type": "integer", "minimum": 0},
         "domains": {"type": "array", "items": _STRING},
     }},
 }
-_REF = {"type": "string", "minLength": 1}
+_SEARCH_QUERY = {**_QUERY, "maxItems": 4}
 CODEX_WEB_SCHEMA = {
     "name": "codex_web",
-    "description": "Use codex_web for Codex-specific operations - image search, opening/finding/clicking within pages, PDF screenshots, finance, weather, sports, or time - or when the task explicitly requires the Codex endpoint. Compatible commands may be combined in one request. For PDF screenshots, open the PDF first and reuse its returned ref_id. Prefer web_search for ordinary provider-neutral search and web_extract for extracting page content. Return endpoint results without inventing facts.",
+    "description": "Use codex_web for Codex-specific web operations: search, image search, open, find, click, PDF screenshots, finance, weather, sports, and time. Use the returned ref_id for follow-up open, find, click, or screenshot calls in the same conversation. Open a PDF before screenshot. Prefer web_search for ordinary provider-neutral search and web_extract for general extraction. Return evidence and never invent sources.",
     "parameters": {
         "type": "object",
         "properties": {
-            "context": {"type": "string", "description": "Optional focused context for this web request."},
-            "input": _INPUT,
-            "reasoning": _REASONING,
-            "search_query": _QUERY,
+            "search_query": _SEARCH_QUERY,
             "image_query": _QUERY,
-            "open": {"type": "array", "items": {"type": "object", "required": ["ref_id"], "properties": {"ref_id": _REF, "lineno": {"type": "integer", "minimum": 0}}}},
-            "click": {"type": "array", "items": {"type": "object", "required": ["ref_id", "id"], "properties": {"ref_id": _REF, "id": {"type": "integer", "minimum": 0}}}},
-            "find": {"type": "array", "items": {"type": "object", "required": ["ref_id", "pattern"], "properties": {"ref_id": _REF, "pattern": _STRING}}},
-            "screenshot": {"type": "array", "description": "Open the PDF first, then reuse its returned ref_id in a later call in the same conversation.", "items": {"type": "object", "required": ["ref_id", "pageno"], "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
-            "finance": {"type": "array", "items": {"type": "object", "required": ["ticker", "type"], "properties": {"ticker": _STRING, "type": {"type": "string", "enum": sorted(FINANCE_TYPES)}, "market": _STRING}}},
-            "weather": {"type": "array", "items": {"type": "object", "required": ["location"], "properties": {"location": _STRING, "start": _STRING, "duration": {"type": "integer", "minimum": 0}}}},
-            "sports": {"type": "array", "items": {"type": "object", "required": ["fn", "league"], "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
-            "time": {"type": "array", "items": {"type": "object", "required": ["utc_offset"], "properties": {"utc_offset": _STRING}}},
+            "open": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id"], "additionalProperties": False, "properties": {"ref_id": _REF, "lineno": {"type": "integer", "minimum": 0}}}},
+            "click": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id", "id"], "additionalProperties": False, "properties": {"ref_id": _REF, "id": {"type": "integer", "minimum": 0}}}},
+            "find": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id", "pattern"], "additionalProperties": False, "properties": {"ref_id": _REF, "pattern": _STRING}}},
+            "screenshot": {"type": "array", "minItems": 1, "description": "Open the PDF first, then reuse its returned ref_id. pageno is zero-based.", "items": {"type": "object", "required": ["ref_id", "pageno"], "additionalProperties": False, "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
+            "finance": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ticker", "type"], "additionalProperties": False, "properties": {"ticker": _STRING, "type": {"type": "string", "enum": sorted(FINANCE_TYPES)}, "market": {"type": "string"}}}},
+            "weather": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["location"], "additionalProperties": False, "properties": {"location": _STRING, "start": _STRING, "duration": {"type": "integer", "minimum": 0}}}},
+            "sports": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fn", "league"], "additionalProperties": False, "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
+            "time": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["utc_offset"], "additionalProperties": False, "properties": {"utc_offset": _STRING}}},
             "response_length": {"type": "string", "enum": sorted(RESPONSE_LENGTHS)},
-            "search_context_size": {"type": "string", "enum": sorted(CONTEXT_SIZES)},
-            "allowed_domains": {"type": "array", "items": _STRING},
-            "blocked_domains": {"type": "array", "items": _STRING},
-            "image_settings": {"type": "object", "properties": {"max_results": {"type": "integer", "minimum": 0}, "caption": {"type": "boolean"}}},
-            "external_web_access": {"oneOf": [{"type": "boolean"}, {"type": "string", "enum": sorted(ACCESS_MODES)}]},
-            "user_location": {"type": "object", "properties": {"country": _STRING, "region": _STRING, "city": _STRING, "timezone": _STRING}},
-            "max_output_tokens": {"type": "integer", "minimum": 1},
         },
         "additionalProperties": False,
     },

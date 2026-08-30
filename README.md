@@ -1,216 +1,162 @@
 # Hermes Codex Web
 
-A standalone Hermes Agent plugin that exposes the Codex-compatible `/alpha/search` web command surface as one model tool: `codex_web`.
-
-## What this is
+A standalone Hermes plugin that exposes a Codex-compatible web adapter as one model tool: `codex_web`.
 
 ```text
-Hermes model
+same Hermes model
   -> codex_web
   -> configured /alpha/search endpoint
-  -> structured output and results
-  -> same Hermes model continues
+  -> evidence, results, and sources
+  -> same Hermes model continues answering
 ```
 
-This plugin does not modify Hermes core, replace `web_search`, run a second answer model, or extract page content. Keep `web_extract` on a separate extraction backend such as Firecrawl.
+This is **not native Codex** and does not replace Hermes with another answering model. It is a Codex-compatible Hermes adapter plus a Codex-style research policy. Keep `web_search` for ordinary provider-neutral search and `web_extract` for general page extraction.
 
-## Commands
+## Public tool surface
 
-`codex_web` supports the complete public `SearchCommands` surface:
+The model-facing schema contains only:
 
-| Field | Use |
-| --- | --- |
-| `search_query` | Search the web. Each item accepts `q`, optional `recency`, and optional `domains`. |
-| `image_query` | Search for images. Same query fields as `search_query`. |
-| `open` | Open a URL or a returned reference ID. Optional `lineno`. |
-| `click` | Open a numbered link from an opened page using `ref_id` and link `id`. |
-| `find` | Find a text pattern in a URL or returned reference ID. |
-| `screenshot` | Screenshot a PDF page using `ref_id` and zero-based `pageno`. |
-| `finance` | Look up `equity`, `fund`, `crypto`, or `index` assets. |
-| `weather` | Forecast by location, with optional start date and duration. |
-| `sports` | NBA, WNBA, NFL, NHL, MLB, EPL, NCAAMB, NCAAWB, or IPL schedules/standings. |
-| `time` | Get time for UTC offsets such as `+07:00`. |
+- `search_query`
+- `image_query`
+- `open`
+- `click`
+- `find`
+- `screenshot`
+- `finance`
+- `weather`
+- `sports`
+- `time`
+- `response_length`
 
-### Request controls
+Rules enforced by the adapter:
 
-| Field | Values / behavior |
-| --- | --- |
-| `response_length` | `short`, `medium`, or `long`. More than three `search_query` items require `medium` or `long`. |
-| `search_context_size` | `low`, `medium`, or `high`. |
-| `allowed_domains` | Restrict web results to these domains. |
-| `blocked_domains` | Exclude these domains. |
-| `image_settings` | `max_results` and/or `caption`. |
-| `external_web_access` | `true`, `false`, `cached`, `indexed`, or `live`. |
-| `user_location` | Approximate `country`, `region`, `city`, and `timezone`. |
-| `max_output_tokens` | Positive output budget. |
-| `context` | Optional focused text input for the request. |
-| `input` | Optional Codex input text or response-item objects. Mutually exclusive with `context`. |
-| `reasoning` | Optional Codex reasoning object with `effort`, `summary`, and `context`. |
+- At most four `search_query` items per call.
+- More than three queries require `response_length: medium` or `long`.
+- Sports payloads receive `tool: "sports"` internally. The model does not need to supply it.
+- `open[].ref_id` accepts an HTTPS or HTTP URL, or a reference returned by an earlier call in the same Hermes conversation.
+- PDF screenshot `pageno` is zero-based, and the PDF must be opened first.
 
-The tool automatically sends `allowed_callers: ["direct"]` because Hermes invokes it directly. The routing model is configuration, not a tool argument.
+The lower-level Python payload builder keeps legacy endpoint controls such as `input`, `reasoning`, `search_context_size`, filters, `external_web_access`, `image_settings`, `user_location`, and `max_output_tokens` for compatibility. They are deliberately absent from the default model-facing schema.
 
-## Installation
+## Install
 
 ```bash
 hermes plugins install https://github.com/duu261/hermes-codex-web.git --enable
 ```
 
-Restart the Hermes surface that will use the plugin:
-
-```bash
-hermes gateway restart
-```
-
-For a current gateway session, restart from a separate terminal because a gateway cannot safely restart itself from inside its own turn.
+Restart the Hermes surface using the plugin after installation.
 
 ## Configuration
 
-Store credentials in Hermes' private environment file, never in this repository:
+Credentials belong in Hermes' private environment file or protected process environment, never in this repository:
 
 ```text
 CODEX_WEB_BASE_URL=https://gateway.example/v1
 CODEX_WEB_API_KEY=replace-me
 ```
 
-The base URL must include `/v1`; the plugin appends `/alpha/search`.
+`CODEX_SEARCH_BASE_URL` and `CODEX_SEARCH_API_KEY` remain accepted as migration fallbacks. Dedicated `CODEX_WEB_*` values win.
 
-Set the non-secret routing model in `config.yaml` through Hermes CLI:
+Set non-secret settings in Hermes config, not `.env`:
 
 ```bash
 hermes config set web.codex_web.model gpt-5.4-mini
 ```
 
-If `web.codex_web.model` is unset, the default is `gpt-5.4-mini`.
+Optional `web.codex_web` settings:
 
-For migration from the basic `hermes-codex-search` plugin, `CODEX_SEARCH_BASE_URL` and `CODEX_SEARCH_API_KEY` are accepted as fallbacks. Dedicated `CODEX_WEB_*` values take precedence.
+- `request_timeout_seconds`, default `60`
+- `max_retries`, default `2`, capped at `5`
+- `retry_base_seconds`, default `0.25`
+- `max_response_bytes`, default `4194304`
+- `session_ttl_seconds`, default `1800`
+- `max_sessions`, default `1024`
 
-## Choosing the tool
+Retries cover HTTP 408, 429, and temporary 5xx responses. `Retry-After` is honored. State is in-process only, bounded, TTL-evicted, thread-safe, and lost on process restart.
 
-Use the normal Hermes tool for ordinary provider-neutral search:
+## Stateful continuation
 
-```text
-web_search
-```
-
-Use `codex_web` when the task needs Codex-specific operations:
-
-```text
-codex_web with search_query
-codex_web with open
-codex_web with find
-codex_web with click
-codex_web with screenshot
-codex_web with finance, weather, sports, or time
-```
-
-For PDF screenshots, call `open` first, then call `screenshot` with the returned `ref_id` in the same conversation. The plugin reuses the Codex request ID per Hermes session so the upstream page context is preserved.
-
-The model can discover the tool from its schema, but explicit wording is safest when a specific command is required:
+The current Hermes runtime path is verified in the installed source:
 
 ```text
-Use codex_web. Search for the official Python 3.13 release notes,
-open the official result, and find the section about free-threaded mode.
+agent/tool_executor.py
+  -> model_tools.handle_function_call(..., session_id=agent.session_id)
+    -> tools.registry.dispatch(..., session_id=session_id)
+      -> plugin handler(params, session_id=session_id)
 ```
 
-## Examples
+`AIAgent` creates or receives a durable Hermes `session_id` for CLI and gateway runs. The gateway also tracks a stable per-chat `gateway_session_key`, but the tool execution contract passes the canonical agent `session_id`, which is the key used here.
 
-### Web search
+The adapter maps one Hermes conversation to one upstream request `id`. It records returned `ref_id` values and rejects missing, cross-session, expired, or post-restart references with a machine-readable `reference_expired` error. It does not persist page context or references to disk.
 
-```json
-{
-  "search_query": [
-    {
-      "q": "official Python 3.13 release notes",
-      "recency": 30,
-      "domains": ["python.org"]
-    }
-  ],
-  "response_length": "short"
-}
+`encrypted_output` is retained in successful adapter results when returned by the endpoint. It is **not replayed** on follow-up requests. Opt-in live testing verified that a search result can be opened successfully without sending the previous `encrypted_output`; this is an observed endpoint result, not a claim about every future deployment.
+
+## Research skill
+
+The plugin registers the opt-in skill `codex-web:codex-web-research`. It teaches Hermes to browse for explicit verification and unstable facts, prefer primary sources, search then open/find/click important claims, open PDFs before screenshots, cite direct URLs, hide internal refs, label inferences, report uncertainty, and retain `web_extract` as the general extraction fallback.
+
+Load it explicitly when wanted:
+
+```text
+/skill codex-web:codex-web-research
 ```
 
-### Open and inspect a page
+## Response shape
 
-```json
-{
-  "open": [
-    {"ref_id": "https://www.python.org/downloads/release/python-3130/"}
-  ],
-  "find": [
-    {
-      "ref_id": "https://www.python.org/downloads/release/python-3130/",
-      "pattern": "free-threaded"
-    }
-  ]
-}
-```
-
-### Specialized lookup
-
-```json
-{
-  "finance": [
-    {"ticker": "BTC", "type": "crypto", "market": ""}
-  ],
-  "weather": [
-    {"location": "Vietnam, Ho Chi Minh City", "duration": 1}
-  ],
-  "time": [
-    {"utc_offset": "+07:00"}
-  ]
-}
-```
-
-### Response shape
+Successful responses are normalized to:
 
 ```json
 {
   "success": true,
-  "output": "human-readable endpoint output",
+  "output": "endpoint text",
   "results": [
     {
       "type": "text_result",
       "ref_id": "turn0search0",
       "title": "Example",
-      "url": "https://example.com"
+      "url": "https://example.com",
+      "future_fields": "preserved"
+    }
+  ],
+  "sources": [
+    {
+      "ref_id": "turn0search0",
+      "title": "Example",
+      "url": "https://example.com",
+      "type": "web"
     }
   ]
 }
 ```
 
-Specialized commands can return useful text in `output` with an empty or omitted `results` list. HTTP 200 error text, malformed result lists, malformed responses, and transport failures are returned as `success: false` instead of fake success.
+`sources` is derived only from actual endpoint result objects containing a URL. The adapter never reconstructs URLs from reference IDs or memory. Unknown fields inside endpoint results are preserved.
 
-## Verified capability matrix
+Errors are machine-readable and distinguish `validation`, `configuration`, `authentication`, `quota`, `rate_limit`, `upstream`, `timeout`, `malformed_response`, `response_too_large`, and `reference_expired` where applicable. Upstream messages are bounded and sanitized. Credentials, authorization headers, endpoint URLs, and request bodies are not returned.
 
-The adapter has been exercised through the live Hermes tool path:
+## Capability matrix
 
-| Capability | Status | Note |
-| --- | --- | --- |
-| `search_query` | Verified | Returns structured web results. |
-| `image_query` | Verified | Returns image findings in endpoint output. |
-| `open` | Verified | Opens a URL and returns page content. |
-| `find` | Verified | Finds text in a URL. |
-| `finance` | Verified | Specialized text output; `results` may be empty. |
-| `weather` | Verified | Specialized text output; `results` may be empty. |
-| `sports` | Verified | Adapter supplies the required `tool: "sports"` value. |
-| `time` | Verified | Specialized text output; `results` may be empty. |
-| `click` | Endpoint-dependent | Requires a valid reference ID and numbered link in the endpoint's request context. Stateless standalone calls may be rejected. |
-| `screenshot` | Endpoint-dependent | Open the PDF first, then reuse its `ref_id` in the same Hermes conversation; deployments without PDF screenshot support reject it. |
+| Capability | Schema-supported | Unit-tested | Live endpoint-tested | Fully stateful in real Hermes | Endpoint-dependent | Status / caveat |
+| --- | --- | --- | --- | --- | --- | --- |
+| `search_query` | Yes | Yes | Yes | Yes | Yes | Four-query and length rules enforced. |
+| `image_query` | Yes | Yes | Yes | Yes | Yes | Endpoint result shape may vary. |
+| `open` | Yes | Yes | Yes | Yes | Yes | URL and returned refs supported. |
+| `find` | Yes | Yes | Yes | Yes | Yes | Requires an opened or returned ref for continuation. |
+| `click` | Yes | Yes | Yes | Yes | Yes | Requires a valid numbered link in endpoint context. |
+| `screenshot` | Yes | Yes | Yes | Yes | Yes | Tested with a direct public PDF; deployment support may vary. |
+| `finance` | Yes | Yes | Yes | Yes | Yes | Supported asset types are endpoint/schema constrained. |
+| `weather` | Yes | Yes | Yes | Yes | Yes | Specialized output may have no result URLs. |
+| `sports` | Yes | Yes | Yes | Yes | Yes | Adapter injects `tool: "sports"`; league support may vary. |
+| `time` | Yes | Yes | Yes | Yes | Yes | Specialized output may have no result URLs. |
+| `response_length` | Yes | Yes | Yes | Yes | Yes | Length is sent in `commands`. |
+| Reference continuation | N/A | Yes | Yes | Yes | Yes | In-process only; TTL, eviction, and restart reset are explicit. |
+| `encrypted_output` | N/A | Yes | Yes | Yes | Yes | Retained when returned; not replayed. |
+| Research policy | N/A | Yes | N/A | Opt-in | No | Registered as `codex-web:codex-web-research`. |
 
-A `success: true` response is not claimed for an upstream error string. The adapter converts recognized HTTP-200 endpoint errors into `success: false`.
+Live rows mean the configured endpoint returned successful results during the opt-in live suite on the maintainer's environment. They do not prove every upstream account, gateway, league, or future backend behaves identically.
 
-## Boundaries
+## Verification
 
-- This is an adapter around the endpoint, not the native Codex runtime.
-- Hermes does not provide native conversation-item construction, but the plugin accepts raw Codex `input` response-item objects when supplied by the caller.
-- `reasoning` and raw `input` are supported; Codex-required headers are generated internally.
-- The plugin does not own a browser session; it preserves a bounded in-process Alpha Search request context per Hermes conversation for follow-up reference IDs. Context is lost after eviction or process restart.
-- Endpoint availability still depends on the configured gateway and its upstream account/pool permissions.
-- Command support is verified against the current endpoint path, but an upstream deployment may reject a command it has disabled.
-
-## Development and verification
-
-The project uses only the Python standard library:
+Unit and static checks:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -219,11 +165,26 @@ git diff --check
 hermes plugins doctor . --ci
 ```
 
-The test suite covers payload construction, command validation, response normalization, HTTP failures, manifest requirements, and public schema parity.
+The live suite is opt-in and skips safely otherwise:
+
+```bash
+CODEX_WEB_LIVE_TESTS=1 python -m unittest tests/test_live.py -v
+```
+
+It covers search → open → find → click, PDF open → screenshot, image search, finance, weather, sports, time, encrypted-output continuation, and concurrent session isolation. Live tests never print credentials or response bodies.
+
+## Known differences from native Codex
+
+- The adapter calls a configured `/alpha/search` endpoint instead of Hermes' or Codex' native internal web runtime.
+- Hermes exposes one function tool, not native Codex web-search call items.
+- Continuation state is bounded in process memory and is lost after restart or eviction.
+- Endpoint permissions and implementation determine whether a command actually succeeds.
+- The adapter does not provide `web_extract`; use Hermes `web_extract` for general extraction.
+- `sources` is an adapter normalization, not a claim that native Codex returns this exact shape.
 
 ## Public-repository rule
 
-Do not commit production domains, internal channel IDs, customer data, credentials, tokens, or secret-bearing logs. Use placeholders in documentation and keep secrets in Hermes' private environment file.
+Do not commit production domains, internal IDs, customer data, credentials, tokens, or secret-bearing logs.
 
 ## License
 
