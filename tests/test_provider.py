@@ -98,6 +98,66 @@ class CodexWebTests(unittest.TestCase):
         self.assertNotIn("context", provider.CODEX_WEB_SCHEMA["parameters"]["properties"])
         self.assertNotIn("max_output_tokens", provider.CODEX_WEB_SCHEMA["parameters"]["properties"])
 
+    def test_strict_differences_from_native_behavior_are_documented_by_tests(self):
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            provider.build_codex_web_payload({"search_query": [{"q": "x", "native_extra": True}]}, model="x")
+        with self.assertRaisesRegex(ValueError, "unknown parameter"):
+            provider.build_codex_web_payload({"search_query": [{"q": "x"}], "native_extra": True}, model="x")
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            provider.build_codex_web_payload({"search_query": [{"q": ""}]}, model="x")
+        with self.assertRaisesRegex(ValueError, "case-sensitive"):
+            provider.build_codex_web_payload({"time": [{"utc_offset": "+07:00"}], "response_length": "SHORT"}, model="x")
+        self.assertEqual(
+            provider.build_codex_web_payload({"search_query": [{"q": "x", "domains": []}]}, model="x")["commands"]["search_query"][0]["domains"],
+            [],
+        )
+        for command, item in (
+            ("image_query", {"q": "x", "extra": True}),
+            ("open", {"ref_id": "https://example.com", "extra": True}),
+            ("click", {"ref_id": "turn0view0", "id": 1, "extra": True}),
+            ("find", {"ref_id": "turn0view0", "pattern": "x", "extra": True}),
+            ("screenshot", {"ref_id": "turn0view0", "pageno": 0, "extra": True}),
+            ("finance", {"ticker": "NVDA", "type": "equity", "extra": True}),
+            ("weather", {"location": "HCMC", "extra": True}),
+            ("sports", {"fn": "schedule", "league": "nba", "extra": True}),
+            ("time", {"utc_offset": "+07:00", "extra": True}),
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "unknown field"):
+                    provider.build_codex_web_payload({command: [item]}, model="x")
+
+    def test_integer_fields_use_unsigned_64_bit_bounds(self):
+        too_large = 2**64
+        for command, item, field in (
+            ("search_query", {"q": "x", "recency": too_large}, "recency"),
+            ("open", {"ref_id": "https://example.com", "lineno": too_large}, "lineno"),
+            ("click", {"ref_id": "https://example.com", "id": too_large}, "id"),
+            ("screenshot", {"ref_id": "https://example.com/a.pdf", "pageno": too_large}, "pageno"),
+            ("weather", {"location": "HCMC", "duration": too_large}, "duration"),
+            ("sports", {"fn": "schedule", "league": "nba", "num_games": too_large}, "num_games"),
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "at most 18446744073709551615"):
+                    provider.build_codex_web_payload({command: [item]}, model="x")
+
+    def test_schema_declares_unsigned_64_bit_maximums(self):
+        properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
+        self.assertEqual(properties["search_query"]["items"]["properties"]["recency"]["maximum"], provider.UINT64_MAX)
+        self.assertEqual(properties["open"]["items"]["properties"]["lineno"]["maximum"], provider.UINT64_MAX)
+        self.assertEqual(properties["click"]["items"]["properties"]["id"]["maximum"], provider.UINT64_MAX)
+        self.assertEqual(properties["screenshot"]["items"]["properties"]["pageno"]["maximum"], provider.UINT64_MAX)
+        self.assertEqual(properties["weather"]["items"]["properties"]["duration"]["maximum"], provider.UINT64_MAX)
+        self.assertEqual(properties["sports"]["items"]["properties"]["num_games"]["maximum"], provider.UINT64_MAX)
+
+    def test_advanced_nested_controls_are_strict_too(self):
+        for field, value in (
+            ("image_settings", {"caption": True, "extra": True}),
+            ("user_location", {"city": "HCMC", "extra": True}),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "unknown field"):
+                    provider.build_codex_web_payload({"time": [{"utc_offset": "+07:00"}], field: value}, model="x")
+
     def test_enforces_four_query_and_response_length_rules(self):
         queries = [{"q": str(i)} for i in range(5)]
         with self.assertRaisesRegex(ValueError, "at most 4"):
@@ -160,6 +220,29 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(result["error"]["type"], "reference_expired")
         urlopen.assert_not_called()
 
+    def test_screenshot_requires_an_opened_reference(self):
+        with self._env(), patch.object(provider, "_open_request") as open_request:
+            result = json.loads(provider.handle_codex_web({
+                "screenshot": [{"ref_id": "https://example.com/file.pdf", "pageno": 0}],
+            }, session_id="s"))
+        self.assertEqual(result["error"]["type"], "validation")
+        self.assertIn("open the PDF first", result["error"]["message"])
+        open_request.assert_not_called()
+
+    def test_screenshot_rejects_search_and_non_pdf_references(self):
+        responses = [
+            FakeResponse({"output": "Search", "results": [{"ref_id": "turn0search0", "url": "https://example.com"}]}),
+            FakeResponse({"output": "Page", "results": [{"ref_id": "turn0view0", "url": "https://example.com"}]}),
+            FakeResponse({"output": "Page", "results": [{"ref_id": "turn0view0", "url": "https://example.com"}]}),
+        ]
+        with self._env(), patch.object(provider, "_open_request", side_effect=responses):
+            provider.handle_codex_web({"search_query": [{"q": "x"}]}, session_id="s")
+            result = json.loads(provider.handle_codex_web({"screenshot": [{"ref_id": "turn0search0", "pageno": 0}]}, session_id="s"))
+            provider.handle_codex_web({"open": [{"ref_id": "turn0search0"}]}, session_id="s")
+            result_non_pdf = json.loads(provider.handle_codex_web({"screenshot": [{"ref_id": "turn0view0", "pageno": 0}]}, session_id="s"))
+        self.assertEqual(result["error"]["type"], "validation")
+        self.assertEqual(result_non_pdf["error"]["type"], "validation")
+
     def test_normalizes_sources_from_endpoint_results_and_keeps_unknown_fields(self):
         response = FakeResponse({"output": "Opened", "results": [{
             "type": "text_result", "ref_id": "turn0search0", "title": "Example",
@@ -196,8 +279,6 @@ class CodexWebTests(unittest.TestCase):
 
     def test_redirects_are_refused_and_opaque_secrets_are_not_echoed(self):
         self.assertIsNone(provider._NoRedirectHandler().redirect_request(None, None, 302, "redirect", {}, "https://other.example"))
-        self.assertNotIn("opaque-production-secret", provider._safe_message("opaque-production-secret", "generic"))
-        self.assertEqual(provider._safe_message("opaque-production-secret", "generic"), "generic")
 
     def test_timeout_malformed_json_and_response_size_are_distinct(self):
         with self._env(), patch.object(provider, "_open_request", side_effect=TimeoutError()):
@@ -226,7 +307,8 @@ class CodexWebTests(unittest.TestCase):
         with self._env(), patch.object(provider, "_open_request", side_effect=responses) as urlopen:
             first = json.loads(provider.handle_codex_web({"search_query": [{"q": "x"}]}, session_id="s"))
             json.loads(provider.handle_codex_web({"open": [{"ref_id": "turn0search0"}]}, session_id="s"))
-        self.assertEqual(first["encrypted_output"], "opaque")
+        self.assertNotIn("encrypted_output", first)
+        self.assertEqual(provider._sessions["s"].encrypted_output, "opaque")
         second_payload = json.loads(urlopen.call_args_list[1].args[0].data)
         self.assertNotIn("encrypted_output", second_payload)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,24 @@ class CodexWebLiveTests(unittest.TestCase):
         opened = self._call({"open": [{"ref_id": ref}]}, "live-chain")
         view_ref = next(item["ref_id"] for item in opened["results"] if item.get("ref_id"))
         self._call({"find": [{"ref_id": view_ref, "pattern": "Python"}]}, "live-chain")
-        self._call({"click": [{"ref_id": view_ref, "id": 1}]}, "live-chain")
+        opened_for_click = opened
+        output = opened_for_click.get("output", "")
+        candidates = sorted({int(value) for value in re.findall(r"(?:^|\s)(\d+)[.)]\s", output)})
+        if not candidates:
+            opened_for_click = self._call({"open": [{"ref_id": "https://www.python.org/downloads/"}]}, "live-chain")
+            view_ref = next(item["ref_id"] for item in opened_for_click["results"] if item.get("ref_id"))
+            output = opened_for_click.get("output", "")
+            candidates = sorted({int(value) for value in re.findall(r"(?:^|\s)(\d+)[.)]\s", output)})
+        if not candidates:
+            self.skipTest("opened endpoint output exposed no numbered links")
+        for link_id in candidates:
+            result = json.loads(provider.handle_codex_web(
+                {"click": [{"ref_id": view_ref, "id": link_id}]},
+                session_id="live-chain",
+            ))
+            if result.get("success"):
+                return
+        self.fail("no numbered link exposed by the opened page was clickable")
 
     def test_pdf_open_screenshot_zero_based(self):
         opened = self._call({"open": [{"ref_id": "https://arxiv.org/pdf/1706.03762.pdf"}]}, "live-pdf")
@@ -54,8 +72,8 @@ class CodexWebLiveTests(unittest.TestCase):
     def test_encrypted_output_is_retained_but_not_needed_on_follow_up(self):
         first = self._call({"search_query": [{"q": "Python official website"}]}, "live-encrypted")
         ref = next(item["ref_id"] for item in first["results"] if item.get("ref_id"))
-        if "encrypted_output" in first:
-            self.assertIsInstance(first["encrypted_output"], str)
+        self.assertNotIn("encrypted_output", first)
+        self.assertIsInstance(provider._sessions["live-encrypted"].encrypted_output, str)
         self._call({"open": [{"ref_id": ref}]}, "live-encrypted")
 
     def test_concurrent_sessions_do_not_cross_references(self):

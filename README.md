@@ -90,9 +90,9 @@ agent/tool_executor.py
 
 `AIAgent` creates or receives a durable Hermes `session_id` for CLI and gateway runs. The gateway also tracks a stable per-chat `gateway_session_key`, but the tool execution contract passes the canonical agent `session_id`, which is the key used here.
 
-The adapter maps one Hermes conversation to one upstream request `id`. It records returned `ref_id` values and rejects missing, cross-session, expired, or post-restart references with a machine-readable `reference_expired` error. It does not persist page context or references to disk.
+The adapter maps one Hermes conversation to one upstream request `id`. It records bounded reference provenance and rejects missing, cross-session, expired, post-restart, non-PDF, or not-yet-opened screenshot references with machine-readable errors. It does not persist page context or references to disk.
 
-`encrypted_output` is retained in successful adapter results when returned by the endpoint. It is **not replayed** on follow-up requests. Opt-in live testing verified that a search result can be opened successfully without sending the previous `encrypted_output`; this is an observed endpoint result, not a claim about every future deployment.
+`encrypted_output` is retained internally in the bounded conversation state when returned by the endpoint. It is never exposed in the model-facing tool result and is **not replayed** on follow-up requests. Opt-in live testing verified that a search result can be opened successfully without sending the previous `encrypted_output`; this is an observed endpoint result, not a claim about every future deployment.
 
 ## Research skill
 
@@ -134,7 +134,7 @@ Successful responses are normalized to:
 
 `sources` is derived only from actual endpoint result objects containing a URL. The adapter never reconstructs URLs from reference IDs or memory. Unknown fields inside endpoint results are preserved.
 
-Errors are machine-readable and distinguish `validation`, `configuration`, `authentication`, `quota`, `rate_limit`, `upstream`, `timeout`, `malformed_response`, `response_too_large`, and `reference_expired` where applicable. Upstream messages are bounded and sanitized. Credentials, authorization headers, endpoint URLs, and request bodies are not returned.
+Errors are machine-readable and distinguish `validation`, `configuration`, `authentication`, `quota`, `rate_limit`, `upstream`, `timeout`, `malformed_response`, `response_too_large`, and `reference_expired` where applicable. Upstream response bodies are not returned. Credentials, authorization headers, endpoint URLs, and request bodies are not returned.
 
 ## Capability matrix
 
@@ -152,10 +152,37 @@ Errors are machine-readable and distinguish `validation`, `configuration`, `auth
 | `time` | Yes | Yes | Yes | Yes | Yes | Specialized output may have no result URLs. |
 | `response_length` | Yes | Yes | Yes | Yes | Yes | Length is sent in `commands`. |
 | Reference continuation | N/A | Yes | Yes | Yes | Yes | In-process only; TTL, eviction, and restart reset are explicit. |
-| `encrypted_output` | N/A | Yes | Yes | Yes | Yes | Retained when returned; not replayed. |
+| `encrypted_output` | N/A | Yes | Yes | Yes | Yes | Retained internally only; hidden from the model and not replayed. |
 | Research policy | N/A | Yes | N/A | Opt-in | No | Registered as `codex-web:codex-web-research`. |
 
 Live rows mean the configured endpoint returned successful results during the opt-in live suite on the maintainer's environment. They do not prove every upstream account, gateway, league, or future backend behaves identically.
+
+## Observed native Codex behavior and intentional differences
+
+Independent native-tool testing on 2026-08-30 used only the first-party callable tool. It observed:
+
+Official references:
+
+- [Codex search command types](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/search.rs)
+- [Codex web tool usage guidance](https://github.com/openai/codex/blob/main/codex-rs/ext/web-search/web_run_description.md)
+
+- Continuation exposed only returned references to the model. No request ID, session ID, thread ID, prior response, or `encrypted_output` parameter was exposed.
+- Search → open and open → find succeeded. Click was page-dependent: one documentation-page link failed while a simple IANA-page link succeeded.
+- Opening a public PDF then screenshotting page `0` succeeded. An out-of-range page, unopened PDF URL, and opened non-PDF page were rejected.
+- Native continuation survived 30+ intervening tool calls in one conversation. Its internal keying, TTL, and eviction behavior remain hidden.
+- The published guidance says four search queries maximum and `medium` or `long` above three queries, but the tested runtime accepted five queries and four queries with `short`.
+- Empty command arrays were rejected. Empty `q` values were accepted. Empty `domains` arrays were accepted.
+- Unknown root and nested fields were accepted and discarded.
+- `sports.tool` appeared optional in callable metadata, but omitting it failed in the tested resolver. Supplying `tool: "sports"` succeeded.
+- Native output was rendered text. The adapter's structured JSON envelope and derived `sources` list are adapter contracts, not native raw-response parity.
+
+The adapter intentionally remains stricter than those observations: it rejects empty `q`, unknown fields, more than four search queries, invalid response-length combinations, non-exact response-length casing, and integers above unsigned 64-bit range. These are deliberate safety and predictability policies, not claims about native runtime enforcement. `encrypted_output` is retained internally only and never exposed to Hermes.
+
+## Hermes CLI/gateway verification boundary
+
+The real installed Hermes `AIAgent` and tool-executor path is covered by `tests/test_hermes_e2e.py`, including direct assertion that the plugin receives the runtime-generated `agent.session_id`.
+
+A full `hermes chat` CLI turn was attempted against temporary local model and HTTPS web stubs. The exact blocker was the temporary model stub's Responses SSE function-call event sequence: Hermes reached the model and received a final response, but the stub event sequence was not accepted as an executable function call, so no CLI-level continuation claim is made. This is a test-harness limitation, not a claim that the installed provider cannot execute tools. Telegram and Discord were not live-tested because doing so would require operating connected gateway sessions and external credentials. No production gateway was changed.
 
 ## Verification
 

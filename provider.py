@@ -40,6 +40,12 @@ DEFAULT_MAX_SESSIONS = 1024
 DEFAULT_MAX_REFS_PER_SESSION = 256
 DEFAULT_MAX_REF_LENGTH = 512
 DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
+UINT64_MAX = 2**64 - 1
+ADVANCED_FIELDS = frozenset({
+    "context", "input", "reasoning", "search_context_size", "allowed_domains",
+    "blocked_domains", "image_settings", "external_web_access", "user_location",
+    "max_output_tokens",
+})
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
@@ -55,7 +61,8 @@ class _ReferenceExpiredError(ValueError):
 class _ConversationState:
     request_id: str
     expires_at: float
-    refs: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    refs: OrderedDict[str, str] = field(default_factory=OrderedDict)
+    encrypted_output: str | None = None
 
 
 def _env(name: str) -> str:
@@ -173,7 +180,15 @@ def _optional_nonnegative_int(value: Any, field: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _ValidationError(f"{field} must be a non-negative integer")
+    if value > UINT64_MAX:
+        raise _ValidationError(f"{field} must be at most {UINT64_MAX}")
     return value
+
+
+def _reject_unknown(item: dict[str, Any], allowed: set[str], field: str) -> None:
+    unknown = sorted(set(item) - allowed)
+    if unknown:
+        raise _ValidationError(f"{field} has unknown field(s): {', '.join(unknown)}")
 
 
 def _string_list(value: Any, field: str) -> list[str] | None:
@@ -229,6 +244,7 @@ def _query_list(value: Any, field: str) -> list[dict[str, Any]] | None:
         raise _ValidationError("search_query supports at most 4 queries")
     result = []
     for index, item in enumerate(rows):
+        _reject_unknown(item, {"q", "recency", "domains"}, f"{field}[{index}]")
         row = {"q": _nonempty_string(item.get("q"), f"{field}[{index}].q")}
         recency = _optional_nonnegative_int(item.get("recency"), f"{field}[{index}].recency")
         domains = _string_list(item.get("domains"), f"{field}[{index}].domains")
@@ -246,6 +262,7 @@ def _operation_list(value: Any, field: str, required: tuple[str, ...], optional_
         return None
     result = []
     for index, item in enumerate(rows):
+        _reject_unknown(item, set(required) | set(optional_ints), f"{field}[{index}]")
         row = {key: _nonempty_string(item.get(key), f"{field}[{index}].{key}") for key in required}
         for key in optional_ints:
             number = _optional_nonnegative_int(item.get(key), f"{field}[{index}].{key}")
@@ -275,6 +292,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
     if rows is not None:
         commands["screenshot"] = []
         for index, item in enumerate(rows):
+            _reject_unknown(item, {"ref_id", "pageno"}, f"screenshot[{index}]")
             pageno = _optional_nonnegative_int(item.get("pageno"), f"screenshot[{index}].pageno")
             if pageno is None:
                 raise _ValidationError(f"screenshot[{index}].pageno is required")
@@ -287,6 +305,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
     if rows is not None:
         commands["click"] = []
         for index, item in enumerate(rows):
+            _reject_unknown(item, {"ref_id", "id"}, f"click[{index}]")
             link_id = _optional_nonnegative_int(item.get("id"), f"click[{index}].id")
             if link_id is None:
                 raise _ValidationError(f"click[{index}].id is required")
@@ -299,6 +318,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
     if rows is not None:
         commands["finance"] = []
         for index, item in enumerate(rows):
+            _reject_unknown(item, {"ticker", "type", "market"}, f"finance[{index}]")
             asset_type = _nonempty_string(item.get("type"), f"finance[{index}].type").lower()
             if asset_type not in FINANCE_TYPES:
                 raise _ValidationError(f"finance[{index}].type must be one of {sorted(FINANCE_TYPES)}")
@@ -318,6 +338,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
     if rows is not None:
         commands["weather"] = []
         for index, item in enumerate(rows):
+            _reject_unknown(item, {"location", "start", "duration"}, f"weather[{index}]")
             row = {"location": _nonempty_string(item.get("location"), f"weather[{index}].location")}
             if item.get("start") is not None:
                 row["start"] = _nonempty_string(item["start"], f"weather[{index}].start")
@@ -330,6 +351,7 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
     if rows is not None:
         commands["sports"] = []
         for index, item in enumerate(rows):
+            _reject_unknown(item, {"tool", "fn", "league", "team", "opponent", "date_from", "date_to", "num_games", "locale"}, f"sports[{index}]")
             function = _nonempty_string(item.get("fn"), f"sports[{index}].fn").lower()
             league = _nonempty_string(item.get("league"), f"sports[{index}].league").lower()
             if function not in SPORTS_FUNCTIONS:
@@ -354,14 +376,17 @@ def _validate_special_operations(params: dict[str, Any]) -> dict[str, list[dict[
 def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: str | None = None) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise _ValidationError("parameters must be an object")
+    unknown = sorted(set(params) - (set(COMMAND_KEYS) | {"response_length"} | ADVANCED_FIELDS))
+    if unknown:
+        raise _ValidationError(f"unknown parameter(s): {', '.join(unknown)}")
     commands = _validate_special_operations(params)
     if not any(key in commands for key in COMMAND_KEYS):
         raise _ValidationError("at least one web command is required")
     response_length = params.get("response_length")
     if response_length is not None:
-        response_length = _nonempty_string(response_length, "response_length").lower()
+        response_length = _nonempty_string(response_length, "response_length")
         if response_length not in RESPONSE_LENGTHS:
-            raise _ValidationError(f"response_length must be one of {sorted(RESPONSE_LENGTHS)}")
+            raise _ValidationError(f"response_length must be one of {sorted(RESPONSE_LENGTHS)} (case-sensitive)")
     if len(commands.get("search_query", [])) > 3 and response_length not in {"medium", "long"}:
         raise _ValidationError("response_length must be medium or long for more than 3 search queries")
     if response_length is not None:
@@ -387,6 +412,7 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
     if image_settings is not None:
         if not isinstance(image_settings, dict):
             raise _ValidationError("image_settings must be an object")
+        _reject_unknown(image_settings, {"max_results", "caption"}, "image_settings")
         image_payload: dict[str, Any] = {}
         max_results = _optional_nonnegative_int(image_settings.get("max_results"), "image_settings.max_results")
         if max_results is not None:
@@ -413,6 +439,7 @@ def build_codex_web_payload(params: dict[str, Any], *, model: str, request_id: s
     if location is not None:
         if not isinstance(location, dict):
             raise _ValidationError("user_location must be an object")
+        _reject_unknown(location, {"country", "region", "city", "timezone"}, "user_location")
         location_payload = {"type": "approximate"}
         for key in ("country", "region", "city", "timezone"):
             if location.get(key) is not None:
@@ -484,15 +511,6 @@ def _request_id(headers: Any, payload: Any = None) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()[:200]
     return None
-
-
-def _safe_message(value: Any, default: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        return default
-    message = value.strip()
-    if any(word in message.lower() for word in ("secret", "password", "credential", "authorization", "api_key", "access_token")):
-        return default
-    return message[:500]
 
 
 def _error(error_type: str, message: str, *, status: int | None = None, request_id: str | None = None) -> dict[str, Any]:
@@ -625,15 +643,10 @@ def _normalize_success(data: Any, request_id: str | None = None) -> dict[str, An
         "results": results,
         "sources": sources,
     }
-    encrypted_output = data.get("encrypted_output")
-    if encrypted_output is not None:
-        if not isinstance(encrypted_output, str):
-            return _error("malformed_response", "Codex Web returned invalid encrypted output")
-        result["encrypted_output"] = encrypted_output
     return result
 
 
-def _post(payload: dict[str, Any]) -> dict[str, Any]:
+def _post(payload: dict[str, Any], state: _ConversationState | None = None) -> dict[str, Any]:
     base_url = _setting("CODEX_WEB_BASE_URL")
     api_key = _setting("CODEX_WEB_API_KEY")
     if not base_url:
@@ -666,7 +679,15 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
                 data, error = _parse_response_body(response, max_response_bytes)
                 if error is not None:
                     return _attach_request_id(error, _request_id(getattr(response, "headers", None)))
-                return _normalize_success(data, _request_id(getattr(response, "headers", None)))
+                if isinstance(data, dict):
+                    encrypted_output = data.get("encrypted_output")
+                    if encrypted_output is not None and not isinstance(encrypted_output, str):
+                        return _error("malformed_response", "Codex Web returned invalid encrypted output")
+                result = _normalize_success(data, _request_id(getattr(response, "headers", None)))
+                if state is not None and isinstance(data, dict) and isinstance(data.get("encrypted_output"), str):
+                    with _sessions_lock:
+                        state.encrypted_output = data["encrypted_output"]
+                return result
         except urllib.error.HTTPError as exc:
             message, status, upstream_request_id = _http_failure(exc)
             if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
@@ -689,6 +710,20 @@ def _is_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def _is_pdf_url(value: Any) -> bool:
+    return isinstance(value, str) and urlparse(value).path.lower().endswith(".pdf")
+
+
+def _is_pdf_result(item: dict[str, Any]) -> bool:
+    if _is_pdf_url(item.get("url")):
+        return True
+    for key in ("content_type", "mime_type", "media_type"):
+        value = item.get(key)
+        if isinstance(value, str) and value.lower().split(";", 1)[0].strip() == "application/pdf":
+            return True
+    return False
+
+
 def _reference_values(params: dict[str, Any]) -> list[str]:
     values = []
     for key in ("open", "find", "click", "screenshot"):
@@ -699,6 +734,12 @@ def _reference_values(params: dict[str, Any]) -> list[str]:
 
 
 def _validate_continuation(params: dict[str, Any], session_id: str | None) -> _ConversationState | None:
+    screenshot_urls: list[str] = []
+    for item in params.get("screenshot") or []:
+        if isinstance(item, dict) and isinstance(item.get("ref_id"), str):
+            screenshot_urls.append(item["ref_id"])
+    if any(_is_url(ref) for ref in screenshot_urls):
+        raise _ValidationError("screenshot requires an opened PDF reference; open the PDF first")
     refs = [ref for ref in _reference_values(params) if not _is_url(ref)]
     if not refs:
         return _session_state(session_id, create=True) if session_id else None
@@ -707,20 +748,50 @@ def _validate_continuation(params: dict[str, Any], session_id: str | None) -> _C
     state = _session_state(session_id, create=False)
     if state is None:
         raise _ReferenceExpiredError("reference expired; repeat the search or open the URL again")
+    screenshot_refs = {
+        item["ref_id"]
+        for item in params.get("screenshot") or []
+        if isinstance(item, dict) and isinstance(item.get("ref_id"), str)
+    }
     with _sessions_lock:
         missing = [ref for ref in refs if ref not in state.refs]
+        non_pdf_screenshots = [ref for ref in refs if ref in screenshot_refs and state.refs.get(ref) != "pdf"]
     if missing:
         raise _ReferenceExpiredError("reference is unknown or expired; repeat the search or open the URL again")
+    if non_pdf_screenshots:
+        raise _ValidationError("screenshot requires an opened PDF reference; open the PDF first")
     return state
 
 
-def _record_refs(state: _ConversationState | None, result: dict[str, Any]) -> None:
+def _record_refs(state: _ConversationState | None, result: dict[str, Any], params: dict[str, Any] | None = None) -> None:
     if state is None or not result.get("success"):
         return
-    refs = []
+    refs: list[tuple[str, str]] = []
+    params = params or {}
+    is_search = "search_query" in params or "image_query" in params
+    open_rows = params.get("open") or []
+    with _sessions_lock:
+        opened_pdf = any(
+            isinstance(item, dict)
+            and isinstance(item.get("ref_id"), str)
+            and (
+                _is_pdf_url(item["ref_id"])
+                or state.refs.get(item["ref_id"]) in {"search_pdf", "pdf"}
+            )
+            for item in open_rows
+        )
     for item in result.get("results", []):
         if isinstance(item, dict) and isinstance(item.get("ref_id"), str) and item["ref_id"].strip():
-            refs.append(item["ref_id"].strip())
+            ref = item["ref_id"].strip()
+            if is_search:
+                kind = "search_pdf" if _is_pdf_result(item) else "search"
+            elif open_rows:
+                kind = "pdf" if opened_pdf or _is_pdf_result(item) else "page"
+            elif params.get("screenshot"):
+                kind = "pdf"
+            else:
+                kind = "unknown"
+            refs.append((ref, kind))
     if refs:
         with _sessions_lock:
             limit = _integer_setting(
@@ -731,10 +802,10 @@ def _record_refs(state: _ConversationState | None, result: dict[str, Any]) -> No
                 "max_ref_length", DEFAULT_MAX_REF_LENGTH,
                 minimum=1, maximum=4096,
             )
-            for ref in refs:
+            for ref, kind in refs:
                 if len(ref) > max_length:
                     continue
-                state.refs[ref] = None
+                state.refs[ref] = kind
                 state.refs.move_to_end(ref)
             while len(state.refs) > limit:
                 state.refs.popitem(last=False)
@@ -753,8 +824,8 @@ def handle_codex_web(params: dict[str, Any], **kwargs: Any) -> str:
         state = _validate_continuation(params, session_id)
         request_id = state.request_id if state is not None else None
         payload = build_codex_web_payload(params, model=_model(), request_id=request_id)
-        result = _post(payload)
-        _record_refs(state, result)
+        result = _post(payload, state)
+        _record_refs(state, result, params)
         return json.dumps(result, ensure_ascii=False)
     except _ReferenceExpiredError as exc:
         return json.dumps(_error("reference_expired", str(exc)), ensure_ascii=False)
@@ -769,10 +840,11 @@ def _model() -> str:
 
 _STRING = {"type": "string", "minLength": 1}
 _REF = {"type": "string", "minLength": 1}
+_UINT64 = {"type": "integer", "minimum": 0, "maximum": UINT64_MAX}
 _QUERY = {
     "type": "array", "minItems": 1,
     "items": {"type": "object", "required": ["q"], "additionalProperties": False, "properties": {
-        "q": _STRING, "recency": {"type": "integer", "minimum": 0},
+        "q": _STRING, "recency": _UINT64,
         "domains": {"type": "array", "items": _STRING},
     }},
 }
@@ -785,13 +857,13 @@ CODEX_WEB_SCHEMA = {
         "properties": {
             "search_query": _SEARCH_QUERY,
             "image_query": _QUERY,
-            "open": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id"], "additionalProperties": False, "properties": {"ref_id": _REF, "lineno": {"type": "integer", "minimum": 0}}}},
-            "click": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id", "id"], "additionalProperties": False, "properties": {"ref_id": _REF, "id": {"type": "integer", "minimum": 0}}}},
+            "open": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id"], "additionalProperties": False, "properties": {"ref_id": _REF, "lineno": _UINT64}}},
+            "click": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id", "id"], "additionalProperties": False, "properties": {"ref_id": _REF, "id": _UINT64}}},
             "find": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id", "pattern"], "additionalProperties": False, "properties": {"ref_id": _REF, "pattern": _STRING}}},
-            "screenshot": {"type": "array", "minItems": 1, "description": "Open the PDF first, then reuse its returned ref_id. pageno is zero-based.", "items": {"type": "object", "required": ["ref_id", "pageno"], "additionalProperties": False, "properties": {"ref_id": _REF, "pageno": {"type": "integer", "minimum": 0}}}},
+            "screenshot": {"type": "array", "minItems": 1, "description": "Open the PDF first, then reuse its returned ref_id. pageno is zero-based.", "items": {"type": "object", "required": ["ref_id", "pageno"], "additionalProperties": False, "properties": {"ref_id": _REF, "pageno": _UINT64}}},
             "finance": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ticker", "type"], "additionalProperties": False, "properties": {"ticker": _STRING, "type": {"type": "string", "enum": sorted(FINANCE_TYPES)}, "market": {"type": "string"}}}},
-            "weather": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["location"], "additionalProperties": False, "properties": {"location": _STRING, "start": _STRING, "duration": {"type": "integer", "minimum": 0}}}},
-            "sports": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fn", "league"], "additionalProperties": False, "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": {"type": "integer", "minimum": 0}, "locale": _STRING}}},
+            "weather": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["location"], "additionalProperties": False, "properties": {"location": _STRING, "start": _STRING, "duration": _UINT64}}},
+            "sports": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fn", "league"], "additionalProperties": False, "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": _UINT64, "locale": _STRING}}},
             "time": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["utc_offset"], "additionalProperties": False, "properties": {"utc_offset": _STRING}}},
             "response_length": {"type": "string", "enum": sorted(RESPONSE_LENGTHS)},
         },
