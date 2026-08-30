@@ -194,6 +194,8 @@ Official references:
 
 An authenticated maintainer test also sent those request controls through a multi-hop reverse-proxy deployment. The endpoint accepted the combined request and returned output. This verifies transport compatibility for that deployment, not that every gateway forwards the fields unchanged or that every field materially affects ranking.
 
+A bounded behavioral probe on that deployment observed effects from `max_output_tokens` and `user_location`. Domain filters and `image_settings` were accepted but not honored, while `context`, `search_context_size`, and `external_web_access` produced no observable change. Treat domain filters and access hints as advisory only. Enforce source and network policy outside this plugin and verify returned domains before relying on them. These observations are deployment-specific and may change upstream.
+
 The adapter intentionally remains stricter than those observations: it rejects empty `q`, unknown fields, more than four search queries, invalid response-length combinations, non-exact response-length casing, and integers above unsigned 64-bit range. These are deliberate safety and predictability policies, not claims about native runtime enforcement. `encrypted_output` is retained internally only and never exposed to Hermes.
 
 ## Hermes CLI/gateway verification boundary

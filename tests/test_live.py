@@ -18,13 +18,23 @@ class CodexWebLiveTests(unittest.TestCase):
     def setUp(self):
         provider.clear_session_state()
 
+    def _request(self, params, session):
+        result = {}
+        for attempt in range(2):
+            result = json.loads(provider.handle_codex_web(params, session_id=session))
+            if result.get("success"):
+                return result
+            error = result.get("error") or {}
+            error_type = error.get("type") if isinstance(error, dict) else None
+            if error_type not in {"upstream", "timeout"} or attempt == 1:
+                return result
+        return result
+
     def _call(self, params, session):
-        result = json.loads(provider.handle_codex_web(params, session_id=session))
+        result = self._request(params, session)
         if not result.get("success"):
             error = result.get("error") or {}
             error_type = error.get("type") if isinstance(error, dict) else None
-            if error_type in {"upstream", "timeout"}:
-                self.skipTest(f"configured endpoint returned transient {error_type}")
             self.fail(error_type or "live request failed")
         return result
 
@@ -44,14 +54,15 @@ class CodexWebLiveTests(unittest.TestCase):
             candidates = sorted({int(value) for value in re.findall(r"(?:^|\s)(\d+)[.)]\s", output)})
         if not candidates:
             self.skipTest("opened endpoint output exposed no numbered links")
+        failures = []
         for link_id in candidates:
-            result = json.loads(provider.handle_codex_web(
-                {"click": [{"ref_id": view_ref, "id": link_id}]},
-                session_id="live-chain",
-            ))
+            result = self._request({"click": [{"ref_id": view_ref, "id": link_id}]}, "live-chain")
             if result.get("success"):
                 return
-        self.fail("no numbered link exposed by the opened page was clickable")
+            error = result.get("error") or {}
+            error_type = error.get("type") if isinstance(error, dict) else None
+            failures.append(f"{link_id}:{error_type or 'unknown'}")
+        self.fail(f"no numbered link exposed by the opened page was clickable ({', '.join(failures)})")
 
     def test_pdf_open_screenshot_zero_based(self):
         opened = self._call({"open": [{"ref_id": "https://arxiv.org/pdf/1706.03762.pdf"}]}, "live-pdf")

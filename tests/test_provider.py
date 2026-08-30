@@ -68,6 +68,17 @@ class CodexWebTests(unittest.TestCase):
         self.assertNotIn("input", properties)
         self.assertNotIn("reasoning", properties)
 
+    def test_schema_warns_agents_about_endpoint_dependent_controls(self):
+        properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
+        self.assertIn("advisory", properties["allowed_domains"]["description"].lower())
+        self.assertIn("verify returned sources", properties["search_query"]["items"]["properties"]["domains"]["description"].lower())
+        self.assertIn("not a security boundary", properties["blocked_domains"]["description"].lower())
+        self.assertIn("not a network or privacy control", properties["external_web_access"]["description"].lower())
+        self.assertIn("sent to", properties["user_location"]["description"].lower())
+        self.assertIn("endpoint-dependent", properties["context"]["description"].lower())
+        self.assertIn("endpoint-dependent", properties["search_context_size"]["description"].lower())
+        self.assertIn("endpoint-dependent", properties["image_settings"]["description"].lower())
+
     def test_builds_all_command_payloads(self):
         payload = provider.build_codex_web_payload({
             "search_query": [{"q": "Hermes", "recency": 7, "domains": ["nousresearch.com"]}],

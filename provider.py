@@ -845,7 +845,7 @@ _QUERY = {
     "type": "array", "minItems": 1,
     "items": {"type": "object", "required": ["q"], "additionalProperties": False, "properties": {
         "q": _STRING, "recency": _UINT64,
-        "domains": {"type": "array", "items": _STRING},
+        "domains": {"type": "array", "items": _STRING, "description": "Advisory domain filter. Verify returned sources; not a security boundary."},
     }},
 }
 _SEARCH_QUERY = {**_QUERY, "maxItems": 4}
@@ -855,7 +855,7 @@ CODEX_WEB_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "context": _STRING,
+            "context": {**_STRING, "description": "Optional context hint. Advisory and endpoint-dependent."},
             "search_query": _SEARCH_QUERY,
             "image_query": _QUERY,
             "open": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id"], "additionalProperties": False, "properties": {"ref_id": _REF, "lineno": _UINT64}}},
@@ -867,13 +867,13 @@ CODEX_WEB_SCHEMA = {
             "sports": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fn", "league"], "additionalProperties": False, "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": _UINT64, "locale": _STRING}}},
             "time": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["utc_offset"], "additionalProperties": False, "properties": {"utc_offset": _STRING}}},
             "response_length": {"type": "string", "enum": sorted(RESPONSE_LENGTHS)},
-            "search_context_size": {"type": "string", "enum": sorted(CONTEXT_SIZES)},
-            "allowed_domains": {"type": "array", "items": _STRING},
-            "blocked_domains": {"type": "array", "items": _STRING},
-            "image_settings": {"type": "object", "minProperties": 1, "additionalProperties": False, "properties": {"max_results": _UINT64, "caption": {"type": "boolean"}}},
-            "external_web_access": {"oneOf": [{"type": "boolean"}, {"type": "string", "enum": sorted(ACCESS_MODES)}]},
-            "user_location": {"type": "object", "additionalProperties": False, "properties": {"country": _STRING, "region": _STRING, "city": _STRING, "timezone": _STRING}},
-            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": UINT64_MAX},
+            "search_context_size": {"type": "string", "enum": sorted(CONTEXT_SIZES), "description": "Advisory retrieval breadth hint. Behavior is endpoint-dependent."},
+            "allowed_domains": {"type": "array", "items": _STRING, "description": "Advisory domain allowlist. Verify returned sources; not a security boundary."},
+            "blocked_domains": {"type": "array", "items": _STRING, "description": "Advisory domain blocklist. Verify returned sources; not a security boundary."},
+            "image_settings": {"type": "object", "minProperties": 1, "additionalProperties": False, "description": "Advisory image result preferences. Behavior is endpoint-dependent.", "properties": {"max_results": _UINT64, "caption": {"type": "boolean"}}},
+            "external_web_access": {"description": "Endpoint access hint. Not a network or privacy control.", "oneOf": [{"type": "boolean"}, {"type": "string", "enum": sorted(ACCESS_MODES)}]},
+            "user_location": {"type": "object", "additionalProperties": False, "description": "Approximate location sent to the configured endpoint and its intermediaries; may affect results.", "properties": {"country": _STRING, "region": _STRING, "city": _STRING, "timezone": _STRING}},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": UINT64_MAX, "description": "Maximum endpoint output tokens."},
         },
         "additionalProperties": False,
     },
