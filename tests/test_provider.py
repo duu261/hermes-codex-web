@@ -53,12 +53,20 @@ class CodexWebTests(unittest.TestCase):
     def test_schema_matches_public_surface_exactly(self):
         properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
         self.assertEqual(set(properties), {
-            "search_query", "image_query", "open", "click", "find", "screenshot",
-            "finance", "weather", "sports", "time", "response_length",
+            "context", "search_query", "image_query", "open", "click", "find",
+            "screenshot", "finance", "weather", "sports", "time", "response_length",
+            "search_context_size", "allowed_domains", "blocked_domains", "image_settings",
+            "external_web_access", "user_location", "max_output_tokens",
         })
         self.assertFalse(provider.CODEX_WEB_SCHEMA["parameters"]["additionalProperties"])
         self.assertEqual(properties["search_query"]["maxItems"], 4)
         self.assertNotIn("tool", properties["sports"]["items"]["properties"])
+        self.assertEqual(properties["search_context_size"]["enum"], sorted(provider.CONTEXT_SIZES))
+        self.assertEqual(properties["external_web_access"]["oneOf"][1]["enum"], sorted(provider.ACCESS_MODES))
+        self.assertEqual(properties["image_settings"]["minProperties"], 1)
+        self.assertEqual(properties["max_output_tokens"]["minimum"], 1)
+        self.assertNotIn("input", properties)
+        self.assertNotIn("reasoning", properties)
 
     def test_builds_all_command_payloads(self):
         payload = provider.build_codex_web_payload({
@@ -79,7 +87,7 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(payload["commands"]["screenshot"][0]["pageno"], 0)
         self.assertEqual(payload["commands"]["open"][0]["ref_id"], "https://example.com")
 
-    def test_advanced_fields_are_backward_compatible_but_hidden(self):
+    def test_advanced_fields_build_payload_and_internal_fields_stay_hidden(self):
         payload = provider.build_codex_web_payload({
             "search_query": [{"q": "Hermes"}],
             "context": "focused context",
@@ -95,8 +103,16 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(payload["input"], "focused context")
         self.assertEqual(payload["settings"]["search_context_size"], "high")
         self.assertEqual(payload["settings"]["filters"]["allowed_domains"], ["example.com"])
-        self.assertNotIn("context", provider.CODEX_WEB_SCHEMA["parameters"]["properties"])
-        self.assertNotIn("max_output_tokens", provider.CODEX_WEB_SCHEMA["parameters"]["properties"])
+        self.assertEqual(payload["settings"]["filters"]["blocked_domains"], ["spam.example"])
+        self.assertEqual(payload["settings"]["image_settings"], {"caption": True})
+        self.assertEqual(payload["settings"]["external_web_access"], "live")
+        self.assertEqual(payload["settings"]["user_location"], {"type": "approximate", "city": "HCMC"})
+        self.assertEqual(payload["max_output_tokens"], 123)
+        properties = provider.CODEX_WEB_SCHEMA["parameters"]["properties"]
+        self.assertIn("context", properties)
+        self.assertIn("max_output_tokens", properties)
+        self.assertNotIn("input", properties)
+        self.assertNotIn("reasoning", properties)
 
     def test_strict_differences_from_native_behavior_are_documented_by_tests(self):
         with self.assertRaisesRegex(ValueError, "unknown field"):

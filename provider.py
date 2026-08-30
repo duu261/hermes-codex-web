@@ -855,6 +855,7 @@ CODEX_WEB_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "context": _STRING,
             "search_query": _SEARCH_QUERY,
             "image_query": _QUERY,
             "open": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["ref_id"], "additionalProperties": False, "properties": {"ref_id": _REF, "lineno": _UINT64}}},
@@ -866,6 +867,13 @@ CODEX_WEB_SCHEMA = {
             "sports": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["fn", "league"], "additionalProperties": False, "properties": {"fn": {"type": "string", "enum": sorted(SPORTS_FUNCTIONS)}, "league": {"type": "string", "enum": sorted(SPORTS_LEAGUES)}, "team": _STRING, "opponent": _STRING, "date_from": _STRING, "date_to": _STRING, "num_games": _UINT64, "locale": _STRING}}},
             "time": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["utc_offset"], "additionalProperties": False, "properties": {"utc_offset": _STRING}}},
             "response_length": {"type": "string", "enum": sorted(RESPONSE_LENGTHS)},
+            "search_context_size": {"type": "string", "enum": sorted(CONTEXT_SIZES)},
+            "allowed_domains": {"type": "array", "items": _STRING},
+            "blocked_domains": {"type": "array", "items": _STRING},
+            "image_settings": {"type": "object", "minProperties": 1, "additionalProperties": False, "properties": {"max_results": _UINT64, "caption": {"type": "boolean"}}},
+            "external_web_access": {"oneOf": [{"type": "boolean"}, {"type": "string", "enum": sorted(ACCESS_MODES)}]},
+            "user_location": {"type": "object", "additionalProperties": False, "properties": {"country": _STRING, "region": _STRING, "city": _STRING, "timezone": _STRING}},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": UINT64_MAX},
         },
         "additionalProperties": False,
     },

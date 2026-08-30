@@ -12,6 +12,12 @@ same Hermes model
 
 This is **not native Codex** and does not replace Hermes with another answering model. It is a Codex-compatible Hermes adapter plus a Codex-style research policy. Keep `web_search` for ordinary provider-neutral search and `web_extract` for general page extraction.
 
+## Transport and trust boundary
+
+The plugin sends requests to an operator-configured `/alpha/search` endpoint. That endpoint may be a reverse proxy or gateway, such as New API or CLIProxyAPI, rather than a direct OpenAI endpoint. The gateway operator controls authentication, upstream account routing, logging, retention, billing, rate limits, request rewriting, and availability.
+
+Use only an HTTPS endpoint you trust and are authorized to access. Installing this plugin does not create an OpenAI or Codex entitlement, prove that an endpoint is first-party, or bypass any provider controls.
+
 ## Public tool surface
 
 The model-facing schema contains only:
@@ -27,6 +33,14 @@ The model-facing schema contains only:
 - `sports`
 - `time`
 - `response_length`
+- `context`
+- `search_context_size`
+- `allowed_domains`
+- `blocked_domains`
+- `image_settings`
+- `external_web_access`
+- `user_location`
+- `max_output_tokens`
 
 Rules enforced by the adapter:
 
@@ -36,7 +50,7 @@ Rules enforced by the adapter:
 - `open[].ref_id` accepts an HTTPS or HTTP URL, or a reference returned by an earlier call in the same Hermes conversation.
 - PDF screenshot `pageno` is zero-based, and the PDF must be opened first.
 
-The lower-level Python payload builder keeps legacy endpoint controls such as `input`, `reasoning`, `search_context_size`, filters, `external_web_access`, `image_settings`, `user_location`, and `max_output_tokens` for compatibility. They are deliberately absent from the default model-facing schema.
+The lower-level Python payload builder additionally accepts `input` and `reasoning` for endpoint compatibility. Those two fields remain deliberately absent from the model-facing schema.
 
 ## Install
 
@@ -151,6 +165,7 @@ Errors are machine-readable and distinguish `validation`, `configuration`, `auth
 | `sports` | Yes | Yes | Yes | Yes | Yes | Adapter injects `tool: "sports"`; league support may vary. |
 | `time` | Yes | Yes | Yes | Yes | Yes | Specialized output may have no result URLs. |
 | `response_length` | Yes | Yes | Yes | Yes | Yes | Length is sent in `commands`. |
+| Native request controls | Yes | Yes | Yes | Yes | Yes | Context, search size, filters, image settings, access mode, location, and output limit are forwarded; whether each changes results is endpoint-dependent. |
 | Reference continuation | N/A | Yes | Yes | Yes | Yes | In-process only; TTL, eviction, and restart reset are explicit. |
 | `encrypted_output` | N/A | Yes | Yes | Yes | Yes | Retained internally only; hidden from the model and not replayed. |
 | Research policy | N/A | Yes | N/A | Opt-in | No | Registered as `codex-web:codex-web-research`. |
@@ -174,7 +189,10 @@ Official references:
 - Empty command arrays were rejected. Empty `q` values were accepted. Empty `domains` arrays were accepted.
 - Unknown root and nested fields were accepted and discarded.
 - `sports.tool` appeared optional in callable metadata, but omitting it failed in the tested resolver. Supplying `tool: "sports"` succeeded.
+- The callable schema exposed `context`, `search_context_size`, domain filters, `image_settings`, `external_web_access`, `user_location`, and `max_output_tokens` to the model.
 - Native output was rendered text. The adapter's structured JSON envelope and derived `sources` list are adapter contracts, not native raw-response parity.
+
+An authenticated maintainer test also sent those request controls through a multi-hop reverse-proxy deployment. The endpoint accepted the combined request and returned output. This verifies transport compatibility for that deployment, not that every gateway forwards the fields unchanged or that every field materially affects ranking.
 
 The adapter intentionally remains stricter than those observations: it rejects empty `q`, unknown fields, more than four search queries, invalid response-length combinations, non-exact response-length casing, and integers above unsigned 64-bit range. These are deliberate safety and predictability policies, not claims about native runtime enforcement. `encrypted_output` is retained internally only and never exposed to Hermes.
 
@@ -209,12 +227,13 @@ It covers search → open → find → click, PDF open → screenshot, image sea
 - Hermes exposes one function tool, not native Codex web-search call items.
 - Continuation state is bounded in process memory and is lost after restart or eviction.
 - Endpoint permissions and implementation determine whether a command actually succeeds.
+- Reverse proxies may inspect, rewrite, ignore, reject, log, retain, or bill request controls differently.
 - The adapter does not provide `web_extract`; use Hermes `web_extract` for general extraction.
 - `sources` is an adapter normalization, not a claim that native Codex returns this exact shape.
 
 ## Responsible use
 
-This project is an independent compatibility adapter for endpoints that users are authorized to access. It does not provide credentials, bypass access controls or rate limits, or grant access to any upstream service. Users are responsible for complying with their provider’s terms and applicable laws and must keep credentials out of source control.
+This project is an independent compatibility adapter for endpoints that users are authorized to access. It does not provide credentials, bypass access controls or rate limits, or grant access to any upstream service. Requests and credentials are handled by the configured endpoint and any intermediaries behind it. Users are responsible for trusting their gateway operator, understanding its data and billing practices, complying with provider terms and applicable laws, and keeping credentials out of source control.
 
 This project is not affiliated with or endorsed by OpenAI or Nous Research.
 
