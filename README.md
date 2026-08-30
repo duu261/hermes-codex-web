@@ -71,8 +71,11 @@ Optional `web.codex_web` settings:
 - `max_response_bytes`, default `4194304`
 - `session_ttl_seconds`, default `1800`
 - `max_sessions`, default `1024`
+- `max_refs_per_session`, default `256`
+- `max_ref_length`, default `512`
+- `max_retry_after_seconds`, default `60`
 
-Retries cover HTTP 408, 429, and temporary 5xx responses. `Retry-After` is honored. State is in-process only, bounded, TTL-evicted, thread-safe, and lost on process restart.
+Retries cover HTTP 408, 429, and temporary 5xx responses. `Retry-After` is honored up to the configured cap. State is in-process only, bounded, TTL-evicted, thread-safe, and lost on process restart.
 
 ## Stateful continuation
 

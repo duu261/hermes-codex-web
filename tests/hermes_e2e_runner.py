@@ -90,6 +90,18 @@ def main() -> None:
             )
             original_open_request = provider_module._open_request
             setattr(provider_module, "_open_request", fake_urlopen)
+            from tools.registry import registry
+
+            entry = registry.get_entry("codex_web")
+            assert entry is not None
+            original_handler = entry.handler
+            received_session_ids: list[str] = []
+
+            def recording_handler(params, **kwargs):
+                received_session_ids.append(kwargs.get("session_id", ""))
+                return original_handler(params, **kwargs)
+
+            entry.handler = recording_handler
             messages: list[dict] = []
 
             def call(number: int, args: dict) -> dict:
@@ -104,7 +116,11 @@ def main() -> None:
             assert call(2, {"open": [{"ref_id": "turn0search0"}]})["success"]
             assert call(3, {"find": [{"ref_id": "turn0view0", "pattern": "x"}]})["success"]
             assert len(set(request_ids)) == 1, request_ids
+            assert received_session_ids == [agent.session_id] * 3
+            assert "e2e" not in received_session_ids
         finally:
+            if "entry" in locals() and "original_handler" in locals():
+                entry.handler = original_handler
             if provider_module is not None and original_open_request is not None:
                 setattr(provider_module, "_open_request", original_open_request)
 

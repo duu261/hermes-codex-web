@@ -131,6 +131,16 @@ class CodexWebTests(unittest.TestCase):
             self.assertIsNone(provider._session_state("ttl", create=False))
             self.assertNotEqual(provider._session_request_id("ttl"), request_id)
 
+    def test_reference_store_is_bounded_by_count_and_length(self):
+        state = provider._session_state("refs", create=True)
+        result = {
+            "success": True,
+            "results": [{"ref_id": ref} for ref in ("one", "two", "three", "four", "too-long")],
+        }
+        with patch.object(provider, "_config", return_value={"max_refs_per_session": 3, "max_ref_length": 5}):
+            provider._record_refs(state, result)
+        self.assertEqual(list(state.refs), ["two", "three", "four"])
+
     def test_handler_reuses_request_id_and_records_refs_for_continuation(self):
         responses = [
             FakeResponse({"output": "Search", "results": [{"ref_id": "turn0search0", "url": "https://example.com"}]}),
@@ -176,6 +186,13 @@ class CodexWebTests(unittest.TestCase):
         self.assertEqual(result["error"]["request_id"], "req-2")
         self.assertNotIn("sk-secret", json.dumps(result))
         self.assertNotIn("prod.example", json.dumps(result))
+
+        capped = HTTPError("https://gateway.example/v1/alpha/search", 503, "busy", {"Retry-After": "999999999"}, io.BytesIO())
+        with self._env(), patch.object(provider, "_open_request", side_effect=[capped, response]), patch.object(provider.time, "sleep") as sleep, patch.object(provider.random, "uniform", return_value=0.0):
+            provider.handle_codex_web({"time": [{"utc_offset": "+07:00"}]})
+        self.assertEqual(sleep.call_args.args[0], provider.DEFAULT_MAX_RETRY_AFTER_SECONDS)
+        self.assertEqual(provider._classify_status(402), "quota")
+        self.assertEqual(provider._classify_status(403), "authentication")
 
     def test_redirects_are_refused_and_opaque_secrets_are_not_echoed(self):
         self.assertIsNone(provider._NoRedirectHandler().redirect_request(None, None, 302, "redirect", {}, "https://other.example"))

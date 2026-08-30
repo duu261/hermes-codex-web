@@ -6,7 +6,6 @@ import email.utils
 import json
 import os
 import random
-import re
 import socket
 import time
 import urllib.error
@@ -38,6 +37,9 @@ DEFAULT_MAX_RETRIES = 2
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_SESSION_TTL_SECONDS = 30 * 60
 DEFAULT_MAX_SESSIONS = 1024
+DEFAULT_MAX_REFS_PER_SESSION = 256
+DEFAULT_MAX_REF_LENGTH = 512
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
@@ -53,7 +55,7 @@ class _ReferenceExpiredError(ValueError):
 class _ConversationState:
     request_id: str
     expires_at: float
-    refs: set[str] = field(default_factory=set)
+    refs: OrderedDict[str, None] = field(default_factory=OrderedDict)
 
 
 def _env(name: str) -> str:
@@ -488,12 +490,8 @@ def _safe_message(value: Any, default: str) -> str:
     if not isinstance(value, str) or not value.strip():
         return default
     message = value.strip()
-    if re.search(r"(?i)(secret|password|credential|authorization|api[_ -]?key|access[_ -]?token)", message):
+    if any(word in message.lower() for word in ("secret", "password", "credential", "authorization", "api_key", "access_token")):
         return default
-    message = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", message)
-    message = re.sub(r"(?i)(?:sk|pk|api|key|token)[-_][A-Za-z0-9._~-]+", "[redacted]", message)
-    message = re.sub(r"https?://[^\s)]+", "[redacted-url]", message)
-    message = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[redacted-email]", message)
     return message[:500]
 
 
@@ -510,19 +508,6 @@ def _attach_request_id(result: dict[str, Any], request_id: str | None) -> dict[s
     if request_id and isinstance(result.get("error"), dict):
         result["error"].setdefault("request_id", request_id)
     return result
-
-
-def _error_message_from_payload(payload: Any) -> str:
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            return _safe_message(error.get("message") or error.get("detail"), "Codex Web returned an error")
-        if isinstance(error, str):
-            return _safe_message(error, "Codex Web returned an error")
-        return _safe_message(payload.get("message"), "Codex Web returned an error")
-    if isinstance(payload, str):
-        return _safe_message(payload, "Codex Web returned an error")
-    return "Codex Web returned an error"
 
 
 def _read_limited(response: Any, limit: int) -> tuple[bytes | None, bool]:
@@ -560,14 +545,18 @@ def _retry_after(headers: Any, now: float | None = None) -> float | None:
     value = _header(headers, "retry-after")
     if not value:
         return None
+    maximum = _numeric_setting(
+        "max_retry_after_seconds", DEFAULT_MAX_RETRY_AFTER_SECONDS,
+        minimum=0.0, maximum=300.0,
+    )
     try:
-        return max(0.0, float(value))
+        return min(maximum, max(0.0, float(value)))
     except ValueError:
         try:
             target = email.utils.parsedate_to_datetime(value)
             if target.tzinfo is None:
                 target = target.replace(tzinfo=timezone.utc)
-            return max(0.0, target.timestamp() - (time.time() if now is None else now))
+            return min(maximum, max(0.0, target.timestamp() - (time.time() if now is None else now)))
         except (TypeError, ValueError, OverflowError):
             return None
 
@@ -579,27 +568,18 @@ def _retry_delay(headers: Any, attempt: int) -> float:
     return max(retry_after or 0.0, backoff) + jitter if retry_after is None else retry_after + jitter
 
 
-def _http_failure(exc: urllib.error.HTTPError, limit: int) -> tuple[str, int | None, str | None]:
+def _http_failure(exc: urllib.error.HTTPError) -> tuple[str, int | None, str | None]:
     headers = getattr(exc, "headers", None)
     request_id = _request_id(headers)
-    payload = None
-    try:
-        body, oversized = _read_limited(exc, limit)
-        if not oversized and body:
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                payload = body.decode("utf-8", errors="replace")
-    except Exception:
-        payload = None
-    return _error_message_from_payload(payload), int(exc.code), request_id
+    status = int(exc.code)
+    return f"Codex Web returned HTTP {status}", status, request_id
 
 
 def _classify_status(status: int) -> str:
+    if status == 402:
+        return "quota"
     if status in {401, 403}:
         return "authentication"
-    if status in {402, 403}:
-        return "quota"
     if status == 429:
         return "rate_limit"
     if 400 <= status < 500:
@@ -611,7 +591,7 @@ def _normalize_success(data: Any, request_id: str | None = None) -> dict[str, An
     if not isinstance(data, dict):
         return _error("malformed_response", "Codex Web returned a JSON value instead of an object")
     if data.get("error") is not None:
-        return _error("upstream", _error_message_from_payload(data), request_id=request_id or _request_id(None, data))
+        return _error("upstream", "Codex Web returned an upstream error", request_id=request_id or _request_id(None, data))
     output = data.get("output")
     results = data.get("results", [])
     if results is None:
@@ -688,7 +668,7 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
                     return _attach_request_id(error, _request_id(getattr(response, "headers", None)))
                 return _normalize_success(data, _request_id(getattr(response, "headers", None)))
         except urllib.error.HTTPError as exc:
-            message, status, upstream_request_id = _http_failure(exc, max_response_bytes)
+            message, status, upstream_request_id = _http_failure(exc)
             if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
                 time.sleep(_retry_delay(getattr(exc, "headers", None), attempt))
                 continue
@@ -737,13 +717,27 @@ def _validate_continuation(params: dict[str, Any], session_id: str | None) -> _C
 def _record_refs(state: _ConversationState | None, result: dict[str, Any]) -> None:
     if state is None or not result.get("success"):
         return
-    refs = set()
+    refs = []
     for item in result.get("results", []):
         if isinstance(item, dict) and isinstance(item.get("ref_id"), str) and item["ref_id"].strip():
-            refs.add(item["ref_id"].strip())
+            refs.append(item["ref_id"].strip())
     if refs:
         with _sessions_lock:
-            state.refs.update(refs)
+            limit = _integer_setting(
+                "max_refs_per_session", DEFAULT_MAX_REFS_PER_SESSION,
+                minimum=1, maximum=4096,
+            )
+            max_length = _integer_setting(
+                "max_ref_length", DEFAULT_MAX_REF_LENGTH,
+                minimum=1, maximum=4096,
+            )
+            for ref in refs:
+                if len(ref) > max_length:
+                    continue
+                state.refs[ref] = None
+                state.refs.move_to_end(ref)
+            while len(state.refs) > limit:
+                state.refs.popitem(last=False)
 
 
 def is_available() -> bool:
