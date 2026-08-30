@@ -185,6 +185,12 @@ It covers search → open → find → click, PDF open → screenshot, image sea
 - The adapter does not provide `web_extract`; use Hermes `web_extract` for general extraction.
 - `sources` is an adapter normalization, not a claim that native Codex returns this exact shape.
 
+## Responsible use
+
+This project is an independent compatibility adapter for endpoints that users are authorized to access. It does not provide credentials, bypass access controls or rate limits, or grant access to any upstream service. Users are responsible for complying with their provider’s terms and applicable laws and must keep credentials out of source control.
+
+This project is not affiliated with or endorsed by OpenAI or Nous Research.
+
 ## Public-repository rule
 
 Do not commit production domains, internal IDs, customer data, credentials, tokens, or secret-bearing logs.
