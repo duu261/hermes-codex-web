@@ -50,8 +50,6 @@ Rules enforced by the adapter:
 - `open[].ref_id` accepts an HTTPS or HTTP URL, or a reference returned by an earlier call in the same Hermes conversation.
 - PDF screenshot `pageno` is zero-based, and the PDF must be opened first.
 
-The lower-level Python payload builder additionally accepts `input` and `reasoning` for endpoint compatibility. Those two fields remain deliberately absent from the model-facing schema.
-
 ## Install
 
 ```bash
@@ -89,24 +87,15 @@ Optional `web.codex_web` settings:
 - `max_ref_length`, default `512`
 - `max_retry_after_seconds`, default `60`
 
-Retries cover HTTP 408, 429, and temporary 5xx responses. `Retry-After` is honored up to the configured cap. State is in-process only, bounded, TTL-evicted, thread-safe, and lost on process restart.
+Retries cover HTTP 408, 429, and temporary 5xx responses. `Retry-After` is honored up to the configured cap.
 
 ## Stateful continuation
 
-The current Hermes runtime path is verified in the installed source:
-
-```text
-agent/tool_executor.py
-  -> model_tools.handle_function_call(..., session_id=agent.session_id)
-    -> tools.registry.dispatch(..., session_id=session_id)
-      -> plugin handler(params, session_id=session_id)
-```
-
-`AIAgent` creates or receives a durable Hermes `session_id` for CLI and gateway runs. The gateway also tracks a stable per-chat `gateway_session_key`, but the tool execution contract passes the canonical agent `session_id`, which is the key used here.
-
-The adapter maps one Hermes conversation to one upstream request `id`. It records bounded reference provenance and rejects missing, cross-session, expired, post-restart, non-PDF, or not-yet-opened screenshot references with machine-readable errors. It does not persist page context or references to disk.
-
-`encrypted_output` is retained internally in the bounded conversation state when returned by the endpoint. It is never exposed in the model-facing tool result and is **not replayed** on follow-up requests. Opt-in live testing verified that a search result can be opened successfully without sending the previous `encrypted_output`; this is an observed endpoint result, not a claim about every future deployment.
+Returned references can be reused for follow-up `open`, `find`, `click`, and
+`screenshot` calls in the same Hermes conversation. Continuation state is
+bounded, process-local, and lost after restart or eviction. `encrypted_output`
+is retained internally when returned by the endpoint, but is never exposed or
+replayed by the adapter.
 
 ## Research skill
 
@@ -198,31 +187,6 @@ A bounded behavioral probe on that deployment observed effects from `max_output_
 
 The adapter intentionally remains stricter than those observations: it rejects empty `q`, unknown fields, more than four search queries, invalid response-length combinations, non-exact response-length casing, and integers above unsigned 64-bit range. These are deliberate safety and predictability policies, not claims about native runtime enforcement. `encrypted_output` is retained internally only and never exposed to Hermes.
 
-## Hermes CLI/gateway verification boundary
-
-The real installed Hermes `AIAgent` and tool-executor path is covered by `tests/test_hermes_e2e.py`, including direct assertion that the plugin receives the runtime-generated `agent.session_id`.
-
-A full `hermes chat` CLI turn was attempted against temporary local model and HTTPS web stubs. The exact blocker was the temporary model stub's Responses SSE function-call event sequence: Hermes reached the model and received a final response, but the stub event sequence was not accepted as an executable function call, so no CLI-level continuation claim is made. This is a test-harness limitation, not a claim that the installed provider cannot execute tools. Telegram and Discord were not live-tested because doing so would require operating connected gateway sessions and external credentials. No production gateway was changed.
-
-## Verification
-
-Unit and static checks:
-
-```bash
-python -m unittest discover -s tests -v
-python -m py_compile provider.py __init__.py
-git diff --check
-hermes plugins doctor . --ci
-```
-
-The live suite is opt-in and skips safely otherwise:
-
-```bash
-CODEX_WEB_LIVE_TESTS=1 python -m unittest tests/test_live.py -v
-```
-
-It covers search → open → find → click, PDF open → screenshot, image search, finance, weather, sports, time, encrypted-output continuation, and concurrent session isolation. Live tests never print credentials or response bodies.
-
 ## Known differences from native Codex
 
 - The adapter calls a configured `/alpha/search` endpoint instead of Hermes' or Codex' native internal web runtime.
@@ -238,10 +202,6 @@ It covers search → open → find → click, PDF open → screenshot, image sea
 This project is an independent compatibility adapter for endpoints that users are authorized to access. It does not provide credentials, bypass access controls or rate limits, or grant access to any upstream service. Requests and credentials are handled by the configured endpoint and any intermediaries behind it. Users are responsible for trusting their gateway operator, understanding its data and billing practices, complying with provider terms and applicable laws, and keeping credentials out of source control.
 
 This project is not affiliated with or endorsed by OpenAI or Nous Research.
-
-## Public-repository rule
-
-Do not commit production domains, internal IDs, customer data, credentials, tokens, or secret-bearing logs.
 
 ## License
 
