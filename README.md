@@ -2,6 +2,24 @@
 
 A standalone Hermes plugin that exposes a Codex-compatible web adapter as one model tool: `codex_web`.
 
+## This is the standalone `codex_web` tool plugin
+
+This repository does **not** replace Hermes' `web_search` backend. It registers a
+separate model-facing tool named `codex_web`:
+
+```text
+Hermes model -> codex_web -> /v1/alpha/search
+```
+
+Use this plugin when you need Codex-style advanced web commands such as
+`open`, `find`, `click`, PDF screenshots, finance, weather, sports, time, or
+image search. It keeps Hermes' ordinary `web_search` and `web_extract` tools
+available.
+
+For a provider that routes Hermes' existing `web_search` tool through Codex,
+use [Hermes Codex Search](https://github.com/duu261/hermes-codex-search)
+instead. That is a separate backend plugin and does not register `codex_web`.
+
 ```text
 same Hermes model
   -> codex_web
