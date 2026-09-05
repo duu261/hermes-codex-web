@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email.utils
+import http.client
 import json
 import os
 import random
@@ -654,21 +655,35 @@ def _post(payload: dict[str, Any], state: _ConversationState | None = None) -> d
     if not api_key:
         return _error("authentication", "CODEX_WEB_API_KEY is not set")
     endpoint = _endpoint(base_url)
-    if urlparse(endpoint).scheme != "https":
+    try:
+        parsed = urlparse(endpoint)
+        hostname = parsed.hostname
+        _ = parsed.port  # Validate the port without echoing parser exceptions.
+        if (not hostname or parsed.username is not None or parsed.password is not None
+                or any(ord(char) <= 32 or ord(char) == 127 for char in endpoint)):
+            return _error("configuration", "CODEX_WEB_BASE_URL must be a valid URL without embedded credentials")
+    except ValueError:
+        return _error("configuration", "CODEX_WEB_BASE_URL must be a valid URL without embedded credentials")
+    if parsed.scheme != "https":
         return _error("configuration", "CODEX_WEB_BASE_URL must use HTTPS")
+    if any(ord(char) < 32 or ord(char) == 127 for char in api_key):
+        return _error("configuration", "CODEX_WEB_API_KEY must not contain control characters")
 
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "OpenAI-Beta": "responses=experimental",
-            "Originator": "codex_cli_rs",
-        },
-        method="POST",
-    )
+    try:
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "OpenAI-Beta": "responses=experimental",
+                "Originator": "codex_cli_rs",
+            },
+            method="POST",
+        )
+    except (ValueError, http.client.InvalidURL):
+        return _error("configuration", "Codex Web request configuration is invalid")
     max_retries = _integer_setting("max_retries", DEFAULT_MAX_RETRIES, minimum=0, maximum=5)
     timeout = _numeric_setting("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS, minimum=0.1, maximum=600.0)
     max_response_bytes = _integer_setting("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES, minimum=1, maximum=64 * 1024 * 1024)
@@ -700,6 +715,8 @@ def _post(payload: dict[str, Any], state: _ConversationState | None = None) -> d
             return _error("upstream", "Could not reach Codex Web")
         except (json.JSONDecodeError, UnicodeDecodeError):
             return _error("malformed_response", "Codex Web returned invalid JSON")
+        except (ValueError, http.client.InvalidURL):
+            return _error("configuration", "Codex Web request configuration is invalid")
         except OSError:
             return _error("upstream", "Could not reach Codex Web")
     return _error("upstream", "Codex Web request failed")
