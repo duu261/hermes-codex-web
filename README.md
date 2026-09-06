@@ -90,7 +90,7 @@ CODEX_WEB_API_KEY=replace-me
 Set non-secret settings in Hermes config, not `.env`:
 
 ```bash
-hermes config set web.codex_web.model gpt-5.4-mini
+hermes config set web.codex_web.model gpt-5.6-luna
 ```
 
 Optional `web.codex_web` settings:

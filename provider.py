@@ -19,7 +19,7 @@ from threading import RLock
 from typing import Any
 from urllib.parse import urlparse
 
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-5.6-luna"
 COMMAND_KEYS = (
     "search_query", "image_query", "open", "click", "find", "screenshot",
     "finance", "weather", "sports", "time",
