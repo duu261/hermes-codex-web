@@ -51,6 +51,13 @@ class CodexWebTests(unittest.TestCase):
             "CODEX_WEB_API_KEY": "secret",
         }, clear=False)
 
+    def test_search_sends_sol_by_default_and_preserves_model_override(self):
+        for config, expected in [({}, "gpt-5.6-sol"), ({"model": "custom-model"}, "custom-model")]:
+            with self.subTest(config=config), self._env(), patch.object(provider, "_config", return_value=config), patch.object(provider, "_open_request", return_value=FakeResponse({"output": "ok", "results": []})) as transport:
+                result = json.loads(provider.handle_codex_web({"search_query": [{"q": "example.com"}]}))
+            self.assertTrue(result["success"])
+            self.assertEqual(json.loads(transport.call_args.args[0].data)["model"], expected)
+
     def test_invalid_configuration_is_rejected_without_exposing_values(self):
         cases = [
             ("CODEX_WEB_API_KEY", "fixture\nAUDIT_MARKER"),
