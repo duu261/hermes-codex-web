@@ -58,6 +58,23 @@ class CodexWebTests(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertEqual(json.loads(transport.call_args.args[0].data)["model"], expected)
 
+    def test_request_user_agent_matches_plugin_version(self):
+        version = next(
+            line.split(":", 1)[1].strip()
+            for line in (ROOT / "plugin.yaml").read_text().splitlines()
+            if line.startswith("version:")
+        )
+        with self._env(), patch.object(
+            provider, "_open_request",
+            return_value=FakeResponse({"output": "ok", "results": []}),
+        ) as transport:
+            result = json.loads(provider.handle_codex_web({"search_query": [{"q": "example.com"}]}))
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            transport.call_args.args[0].get_header("User-agent"),
+            f"hermes-codex-web/{version}",
+        )
+
     def test_invalid_configuration_is_rejected_without_exposing_values(self):
         cases = [
             ("CODEX_WEB_API_KEY", "fixture\nAUDIT_MARKER"),

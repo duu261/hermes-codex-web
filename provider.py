@@ -677,6 +677,7 @@ def _post(payload: dict[str, Any], state: _ConversationState | None = None) -> d
                 "Accept": "application/json",
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "hermes-codex-web/0.1.2",
                 "OpenAI-Beta": "responses=experimental",
                 "Originator": "codex_cli_rs",
             },
